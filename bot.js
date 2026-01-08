@@ -97,13 +97,6 @@ const NOTIFICATION_CHANNEL = process.env.NOTIFICATION_CHANNEL;
 const DAILY_REWARDS_CHANNEL = process.env.DAILY_REWARDS_CHANNEL;
 const TEA_CHANNEL_ID = process.env.TEA_CHANNEL_ID;
 
-
-// Channel where DM messages will be forwarded to
-const DM_FORWARD_CHANNEL_ID = process.env.DM_FORWARD_CHANNEL_ID;
-// Your Discord user ID (the person who can send DMs to the bot)
-const AUTHORIZED_DM_USER_ID = process.env.AUTHORIZED_DM_USER_ID;
-
-
 // Role IDs for permissions and rewards
 const TEA_ROLE_ID = process.env.TEA_ROLE_ID;
 const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID;
@@ -112,10 +105,21 @@ const GUILD_ID = process.env.GUILD_ID;
 // Bot configuration
 const PREFIX = '!';
 
+// Random chat configuration
+const RANDOM_CHAT_CHANNELS = process.env.RANDOM_CHAT_CHANNELS
+    ? process.env.RANDOM_CHAT_CHANNELS.split(',').map(id => id.trim())
+    : [];
+const RANDOM_REPLY_CHANCE = 0.001;      // 0.1% chance to reply to any message
+const MIN_MESSAGE_INTERVAL = 3600000;   // 60 minutes minimum between random messages
+const MAX_MESSAGE_INTERVAL = 7200000;   // 120 minutes maximum between random messages
+
 // Global variables for shop message tracking
 let mochiShopMessageId = null;
 let waterlilyShopMessageId = null;
 let equipmentShopMessageId = null;
+
+// Random chat tracking
+let recentlyActive = new Set(); // Track channels where bot recently spoke
 // [REMOVED] Unused globalthread variable
 
 // ============================================================================
@@ -365,16 +369,10 @@ const client = new Client({
 // RANDOM CONVERSATION SYSTEM
 // ============================================================================
 
-// Configuration for random chat behavior
-const RANDOM_CHAT_CHANNELS = (process.env.RANDOM_CHAT_CHANNELS || '').split(',').filter(Boolean);
-const RANDOM_REPLY_CHANCE = 0.001;      // 0.1% chance to reply to any message
-const RANDOM_INITIATE_CHANCE = 0.0005;  // 0.05% chance to start a conversation  
-const MIN_MESSAGE_INTERVAL = 3600000;   // 60 minutes minimum between random messages
-const MAX_MESSAGE_INTERVAL = 7200000;   // 120 minutes maximum between random messages
+// Configuration for random chat behavior (already declared earlier at line ~116)
 
 // Track bot's conversation state
 let lastRandomMessage = 0;
-let recentlyActive = new Set(); // Track channels where bot recently spoke
 
 // Conversation starters for different times of day
 const conversationStarters = {
@@ -463,81 +461,6 @@ function getRandomResponse(responseArray) {
 
 
 // [REMOVED] enhancePersonalityWithGifts function (part of removed gift system)
-
-
-
-// ============================================================================
-// MAIN DM HANDLER
-// ============================================================================
-
-async function handleDMForwarding(message) {
-    
-    // Only handle messages from authorized user
-    if (message.author.id !== AUTHORIZED_DM_USER_ID) return;
-    
-    try {
-        const targetChannel = await client.channels.fetch(DM_FORWARD_CHANNEL_ID);
-        if (!targetChannel) {
-            console.error('Target channel not found');
-            return;
-        }
-
-        const content = message.content.trim();
-        
-        // Handle reply command: /reply MESSAGE_ID your message here
-        if (content.startsWith('/reply ')) {
-            const parts = content.slice(7).split(' ');
-            const messageId = parts[0];
-            const replyText = parts.slice(1).join(' ');
-            
-            if (!messageId || !replyText) {
-                await message.react('❌');
-                return;
-            }
-            
-            try {
-                const targetMessage = await targetChannel.messages.fetch(messageId);
-                await targetMessage.reply(replyText);
-                await message.react('✅');
-                return;
-            } catch (error) {
-                await message.react('❌');
-                return;
-            }
-        }
-        
-        // Handle regular message forwarding
-        const messageData = {};
-        
-        // Add text content if present
-        if (message.content) {
-            messageData.content = message.content;
-        }
-        
-        // Add attachments if present
-        if (message.attachments.size > 0) {
-            messageData.files = Array.from(message.attachments.values()).map(attachment => ({
-                attachment: attachment.url,
-                name: attachment.name
-            }));
-        }
-        
-        // Send only if there's content or files
-        if (messageData.content || messageData.files) {
-            await targetChannel.send(messageData);
-            await message.react('✅');
-        }
-        
-    } catch (error) {
-        console.error('Error forwarding DM:', error);
-        await message.react('❌');
-    }
-}
-
-
-
-
-
 
 // Store a fact about a user in memory
 async function storeUserFact(userId, fact, category = 'general', confidence = 1.0, source = null) {
@@ -936,6 +859,127 @@ function scheduleContextCleanup() {
     }, ONE_DAY);
 }
 
+// ============================================================================
+// RANDOM CHAT FUNCTIONS
+// ============================================================================
+
+// Schedule random message sending
+function scheduleRandomMessage() {
+    const delay = Math.random() * (MAX_MESSAGE_INTERVAL - MIN_MESSAGE_INTERVAL) + MIN_MESSAGE_INTERVAL;
+
+    setTimeout(async () => {
+        try {
+            // Pick a random channel
+            const channelId = RANDOM_CHAT_CHANNELS[Math.floor(Math.random() * RANDOM_CHAT_CHANNELS.length)];
+            const channel = client.channels.cache.get(channelId);
+
+            if (!channel) {
+                scheduleRandomMessage();
+                return;
+            }
+
+            // Check if appropriate to send
+            if (!await shouldSendRandomMessage(channelId)) {
+                scheduleRandomMessage();
+                return;
+            }
+
+            // Generate and send message
+            const message = await generateRandomMessage(channel);
+            const sentMessage = await channel.send(message);
+
+            // Store in conversation context
+            await storeConversationMessage(
+                channelId,
+                sentMessage.id,
+                client.user.id,
+                client.user.username,
+                message,
+                true
+            );
+
+            // Mark as recently active
+            recentlyActive.add(channelId);
+            setTimeout(() => recentlyActive.delete(channelId), 600000); // 10 minute cooldown
+
+            console.log(`🤖 Sent random message to ${channel.name}`);
+        } catch (error) {
+            console.error('❌ Error sending random message:', error);
+        }
+
+        // Schedule next random message
+        scheduleRandomMessage();
+    }, delay);
+}
+
+// Check if appropriate to send random message
+async function shouldSendRandomMessage(channelId) {
+    // Get recent conversation activity
+    const recentContext = await getChannelContext(channelId, 10);
+    if (recentContext.length === 0) return false;
+
+    // Check last message time
+    const lastMessageTime = recentContext[recentContext.length - 1].timestamp || 0;
+    const timeSinceLastMessage = Date.now() - lastMessageTime;
+
+    // Don't send if conversation is too old (> 2 hours) or too recent (< 2 minutes)
+    if (timeSinceLastMessage > 7200000 || timeSinceLastMessage < 120000) return false;
+
+    // Check if bot last message was too recent
+    const lastBotMessage = recentContext.filter(msg => msg.is_bot).pop();
+    if (lastBotMessage) {
+        const timeSinceBotMessage = Date.now() - (lastBotMessage.timestamp || 0);
+        if (timeSinceBotMessage < 600000) return false; // 10 minute cooldown
+    }
+
+    // Check active users
+    const activeUsers = await getActiveUsersInConversation(channelId, 3600000); // 1 hour
+    return activeUsers.length >= 2; // At least 2 people talking
+}
+
+// Enhanced random message with context awareness
+async function generateRandomMessage(channel) {
+    try {
+        // Get conversation context
+        const recentContext = await getChannelContext(channel.id, 10);
+        const activeUsers = await getActiveUsersInConversation(channel.id);
+
+        // Sometimes reference recent conversation (30% chance)
+        if (Math.random() < 0.3 && recentContext.length > 0) {
+            const recentTopics = recentContext.map(msg => msg.content).join(' ');
+
+            const response = await openai.chat.completions.create({
+                model: 'gpt-4o-mini',
+                messages: [
+                    {
+                        role: 'system',
+                        content: casualPersonality +
+                        '\n\nYou want to jump into the conversation naturally. Reference something that was said earlier or ask a follow-up question. Keep it short and casual.'
+                    },
+                    ...recentContext.slice(-5).map(msg => ({
+                        role: msg.is_bot ? 'assistant' : 'user',
+                        content: msg.is_bot ? msg.content : `${msg.username}: ${msg.content}`
+                    })),
+                    {
+                        role: 'user',
+                        content: 'Generate a natural message to continue or revive this conversation'
+                    }
+                ],
+                temperature: 0.9,
+                max_tokens: 100
+            });
+
+            return response.choices[0].message.content;
+        }
+
+        // Otherwise use time-based starter
+        return getTimeBasedStarter();
+    } catch (error) {
+        console.error('❌ Error generating random message:', error);
+        return getTimeBasedStarter();
+    }
+}
+
 // Remove user memory by keyword
 async function removeUserMemory(userId, keyword) {
     return new Promise((resolve, reject) => {
@@ -973,39 +1017,6 @@ const validButtonIds = [
     'helmet', 'chest', 'chest_golden',
     // Control buttons
     'yes', 'no'
-];
-
-// Waterlily offering prize configuration with dynamic weights
-const PRIZES = [
-    { 
-        name: 'Discord Cosmetic', 
-        baseWeight: 5, 
-        emoji: '💠',
-        bonusPerLily: 0.4 // +0.4% per Waterlily offered
-    },
-    { 
-        name: 'Discord Nitro', 
-        baseWeight: 5, 
-        emoji: '🪨',
-        bonusPerLily: 0.4 // +0.4% per Waterlily offered
-    },
-    { 
-        name: 'Custom Artwork', 
-        baseWeight: 4, 
-        emoji: '🪨',
-        bonusPerLily: 0.4 // +0.4% per Waterlily offered
-    },
-    { 
-        name: 'Nothing', 
-        baseWeight: 50, 
-        emoji: '❌',
-        bonusPerLily: -1.2 // -1.2% per Waterlily (reduces chance of nothing)
-    }
-];
-
-// Gacha ball prize configuration
-const GACHA_PRIZES = [
-    { name: 'Nothing', weight: 65, emoji: '❌' }
 ];
 
 // ============================================================================
@@ -2145,143 +2156,6 @@ async function tradeItem(senderId, receiverId, itemName, amount) {
 }
 
 // ============================================================================
-// WATERLILY OFFERING SYSTEM
-// ============================================================================
-
-// Create sacrifice embed for Waterlily offerings
-function createSacrificeEmbed() {
-    return new EmbedBuilder()
-        .setColor(0x4CA3DD)
-        .setTitle('🌺 Waterlily Offering')
-        .setDescription(
-           'Offer your Waterlilies to Nemuriha-nushi for a chance to win mystical prizes!\n\n' +
-           'The more Waterlilies you offer, the higher your chances of winning rare and valuable rewards. Choose wisely - while greater offerings improve your odds, there\'s no guarantee of victory.')
-        .setImage('https://i.ibb.co/w4Q9Qw1/f28702cf-31e3-47ba-8b23-ebd5d7bbe5b6.jpg')
-        .setThumbnail('https://i.ibb.co/DCJGFvK/3cb797d1-0649-4620-89a5-871b9f11ed15.jpg');
-}
-
-// Create sacrifice button
-function createSacrificeButton() {
-    return new ActionRowBuilder()
-        .addComponents(
-            new ButtonBuilder()
-                .setCustomId('sacrifice_waterlily')
-                .setLabel('Offer Waterlilies')
-                .setStyle(ButtonStyle.Danger)
-                .setEmoji('🌺')
-        );
-}
-
-// Create sacrifice modal
-function createSacrificeModal() {
-    return new ModalBuilder()
-        .setCustomId('sacrifice_modal')
-        .setTitle('Waterlily Offering')
-        .addComponents(
-            new ActionRowBuilder().addComponents(
-                new TextInputBuilder()
-                    .setCustomId('sacrifice_amount')
-                    .setLabel('How many Waterlilies to offer?')
-                    .setStyle(TextInputStyle.Short)
-                    .setPlaceholder('Enter amount...')
-                    .setRequired(true)
-            )
-        );
-}
-
-// Calculate adjusted weights based on sacrifice amount
-function calculateAdjustedWeights(amount) {
-    return PRIZES.map(prize => ({
-        ...prize,
-        adjustedWeight: Math.max(1, prize.baseWeight + (prize.bonusPerLily * amount))
-    }));
-}
-
-// Select prize based on adjusted weights
-function selectPrize(amount) {
-    const adjustedPrizes = calculateAdjustedWeights(amount);
-    const totalWeight = adjustedPrizes.reduce((sum, prize) => sum + prize.adjustedWeight, 0);
-    let random = Math.random() * totalWeight;
-    
-    for (const prize of adjustedPrizes) {
-        if (random < prize.adjustedWeight) return prize;
-        random -= prize.adjustedWeight;
-    }
-    return adjustedPrizes[adjustedPrizes.length - 1];
-}
-
-// Handle sacrifice process with transaction
-async function handleSacrifice(interaction, amount) {
-    const userId = interaction.user.id;
-    return new Promise((resolve, reject) => {
-        db.serialize(() => {
-            db.run('BEGIN TRANSACTION', (err) => {
-                if (err) {
-                    console.error('❌ Failed to start transaction:', err);
-                    return reject(new Error('Transaction failed. Please try again.'));
-                }
-            });
-
-            // Check user balance
-            db.get('SELECT Waterlily FROM users WHERE Discord = ?', [userId], async (err, row) => {
-                if (err || !row || row.Waterlily < amount) {
-                    db.run('ROLLBACK');
-                    return reject(new Error("Insufficient Waterlilies"));
-                }
-
-                // Subtract Waterlilies
-                db.run('UPDATE users SET Waterlily = Waterlily - ? WHERE Discord = ?', 
-                    [amount, userId], async (err) => {
-                    if (err) {
-                        db.run('ROLLBACK');
-                        return reject(err);
-                    }
-
-                    // Select prize with adjusted probabilities
-                    const prize = selectPrize(amount);
-
-                    // Calculate actual probability for transparency
-                    const adjustedPrizes = calculateAdjustedWeights(amount);
-                    const totalWeight = adjustedPrizes.reduce((sum, p) => sum + p.adjustedWeight, 0);
-                    const probability = ((prize.adjustedWeight / totalWeight) * 100).toFixed(1);
-
-                    // Send notification
-                    const notifChannel = await interaction.client.channels.fetch(NOTIFICATION_CHANNEL);
-                    await notifChannel.send(
-                        `🌺 <@${userId}> offered ${amount} Waterlilies and received ${prize.emoji} ${prize.name}! ` +
-                        `(Chance was ${probability}%)`
-                    );
-
-                    db.run('COMMIT', (err) => {
-                        if (err) {
-                            db.run('ROLLBACK');
-                            return reject(err);
-                        }
-                        resolve({ prize, probability });
-                    });
-                });
-            });
-        });
-    });
-}
-
-// ============================================================================
-// GACHA SYSTEM
-// ============================================================================
-
-// Select gacha prize from available options
-function selectGachaPrize() {
-    const totalWeight = GACHA_PRIZES.reduce((sum, prize) => sum + prize.weight, 0);
-    let random = Math.random() * totalWeight;
-    
-    for (const prize of GACHA_PRIZES) {
-        if (random < prize.weight) return prize;
-        random -= prize.weight;
-    }
-    return GACHA_PRIZES[GACHA_PRIZES.length - 1];
-}
-
-// ============================================================================
 // SHOP SETUP AND MANAGEMENT
 // ============================================================================
 
@@ -2741,75 +2615,6 @@ async function handleEquipmentPurchase(interaction) {
             }).catch(console.error);
         }
     }
-}
-
-// ============================================================================
-// DATABASE MIGRATION FUNCTIONS
-// ============================================================================
-
-// Migration function for adding Waterlily support to existing installations
-async function migrateDatabase() {
-    return new Promise((resolve, reject) => {
-        db.serialize(() => {
-            console.log('🔄 Running database migration...');
-
-            // Add Waterlily column if it doesn't exist
-            db.run(`
-                ALTER TABLE users 
-                ADD COLUMN Waterlily INTEGER DEFAULT 0
-            `, (err) => {
-                if (err && !err.message.includes('duplicate')) {
-                    console.error('❌ Error adding Waterlily column:', err);
-                    reject(err);
-                    return;
-                }
-
-                // Initialize Waterlily shop items if needed
-                db.get('SELECT COUNT(*) as count FROM waterlily_items', (err, row) => {
-                    if (err || row.count === 0) {
-                        console.log('🌺 Initializing Waterlily shop items...');
-                        const waterlilyItems = [
-                            { id: 'witem1', name: 'Golden Waterlily', cost: 100, available: 10 },
-                            { id: 'witem2', name: 'Mystical Pond', cost: 75, available: 15 },
-                            { id: 'witem3', name: 'Lily Pad Crown', cost: 50, available: 20 },
-                            { id: 'witem4', name: 'Aqua Essence', cost: 25, available: 30 },
-                            { id: 'witem5', name: 'Water Spirit', cost: 15, available: 40 }
-                        ];
-
-                        const stmt = db.prepare(`
-                            INSERT OR REPLACE INTO waterlily_items (id, name, cost, available)
-                            VALUES (?, ?, ?, ?)
-                        `);
-
-                        waterlilyItems.forEach(item => {
-                            stmt.run(item.id, item.name, item.cost, item.available);
-                        });
-                        stmt.finalize();
-                        console.log('✅ Waterlily shop items initialized');
-                    }
-                    resolve();
-                });
-            });
-        });
-    });
-}
-
-// Add shop_type column to user_inventory for tracking item sources
-async function addShopTypeColumn() {
-    return new Promise((resolve, reject) => {
-        db.run(`
-            ALTER TABLE user_inventory
-            ADD COLUMN shop_type TEXT DEFAULT 'mochi'
-        `, (err) => {
-            if (err && !err.message.includes('duplicate')) {
-                console.error('❌ Error adding shop_type column:', err);
-                reject(err);
-                return;
-            }
-            console.log('✅ Shop type column migration completed');
-            resolve();
-        });
-    });
 }
 
 // ============================================================================
@@ -3355,129 +3160,6 @@ async function unequipItem(userId, itemId) {
 }
 
 // ============================================================================
-// EQUIPMENT MAINTENANCE
-// ============================================================================
-
-// Clean up duplicate equipped items (maintenance function)
-async function cleanupEquippedItems() {
-    return new Promise((resolve, reject) => {
-        db.serialize(() => {
-            db.run('BEGIN TRANSACTION');
-            
-            // First, identify users with duplicate slot entries
-            db.all(`
-                SELECT Discord, slot_id, COUNT(*) as count
-                FROM equipped_items
-                GROUP BY Discord, slot_id
-                HAVING count > 1
-            `, [], async (err, duplicates) => {
-                if (err) {
-                    db.run('ROLLBACK');
-                    return reject(err);
-                }
-                
-                try {
-                    console.log(`🧹 Found ${duplicates.length} duplicate equipment entries to clean up`);
-
-                    // For each user with duplicates
-                    for (const dupe of duplicates) {
-                        // Get the most recent equipped item for this slot
-                        const mostRecent = await new Promise((res, rej) => {
-                            db.get(`
-                                SELECT rowid, * FROM equipped_items
-                                WHERE Discord = ? AND slot_id = ?
-                                ORDER BY equipped_at DESC
-                                LIMIT 1
-                            `, [dupe.Discord, dupe.slot_id], (err, row) => {
-                                if (err) rej(err);
-                                else res(row);
-                            });
-                        });
-                        
-                        // Delete all other entries for this slot
-                        await new Promise((res, rej) => {
-                            db.run(`
-                                DELETE FROM equipped_items
-                                WHERE Discord = ? AND slot_id = ? AND rowid != ?
-                            `, [dupe.Discord, dupe.slot_id, mostRecent.rowid], (err) => {
-                                if (err) rej(err);
-                                else res();
-                            });
-                        });
-                    }
-                    
-                    db.run('COMMIT', (err) => {
-                        if (err) {
-                            db.run('ROLLBACK');
-                            return reject(err);
-                        }
-                        if (duplicates.length > 0) {
-                            console.log(`✅ Cleaned up ${duplicates.length} duplicate equipment entries`);
-                        }
-                        resolve();
-                    });
-                } catch (error) {
-                    db.run('ROLLBACK');
-                    reject(error);
-                }
-            });
-        });
-    });
-}
-
-// Debug function for troubleshooting item issues
-async function debugItem(itemId) {
-    console.log(`===== DEBUG INFO FOR ITEM ${itemId} =====`);
-    
-    // Check equipment_items table
-    try {
-        const equipData = await new Promise((resolve, reject) => {
-            db.get(`SELECT * FROM equipment_items WHERE id = ?`, [itemId], (err, row) => {
-                if (err) reject(err);
-                else resolve(row);
-            });
-        });
-        
-        console.log("EQUIPMENT DATA:", equipData || "Not found in equipment_items");
-        
-        // Check item_versions table
-        const versionData = await new Promise((resolve, reject) => {
-            db.all(`SELECT * FROM item_versions WHERE item_id = ? ORDER BY version_date DESC`, [itemId], (err, rows) => {
-                if (err) reject(err);
-                else resolve(rows);
-            });
-        });
-        
-        console.log("VERSION DATA:", versionData.length ? versionData : "No versions found");
-        
-        // Check if in shops
-        const [mochiItem, waterlilyItem] = await Promise.all([
-            new Promise((resolve, reject) => {
-                db.get(`SELECT * FROM items WHERE id = ?`, [itemId], (err, row) => {
-                    if (err) reject(err);
-                    else resolve(row);
-                });
-            }),
-            new Promise((resolve, reject) => {
-                db.get(`SELECT * FROM waterlily_items WHERE id = ?`, [itemId], (err, row) => {
-                    if (err) reject(err);
-                    else resolve(row);
-                });
-            })
-        ]);
-        
-        console.log("MOCHI SHOP:", mochiItem || "Not found in mochi shop");
-        console.log("WATERLILY SHOP:", waterlilyItem || "Not found in waterlily shop");
-        
-        console.log(`===== END DEBUG INFO =====`);
-        
-    } catch (error) {
-        console.error("❌ Error during debug:", error);
-    }
-}
-
-
-// ============================================================================
 // COMMAND DEFINITIONS & INTERACTION HANDLERS
 // ============================================================================
 // This section contains all slash command definitions and their handlers,
@@ -3487,16 +3169,6 @@ async function debugItem(itemId) {
 // ============================================================================
 // SLASH COMMAND DEFINITIONS
 // ============================================================================
-
-// Logo options for faction command
-const logoOptions = [
-    { name: 'Waterlily Festival', value: 'festival.png' },
-    { name: 'Domenican Empire', value: 'logo1.png' },
-    { name: 'Sea Ronin', value: 'logo2.png' },
-    { name: 'Kanaui', value: 'logo3.png' },
-    { name: 'Aetherwrights', value: 'logo4.png' },
-    { name: 'Tunuk', value: 'logo5.png' }
-];
 
 // Main command definitions array
 const commands = [
@@ -3558,24 +3230,6 @@ const commands = [
             option.setName('mochi')
                 .setDescription('Amount of Mochi to convert')
                 .setRequired(true)),
-
-    // Game features
-    new SlashCommandBuilder()
-        .setName('gacha')
-        .setDescription('Open a Gacha Ball from your inventory'),
-
-    new SlashCommandBuilder()
-        .setName('faction')
-        .setDescription('Add a Faction Emblem to your profile picture')
-        .addStringOption(option =>
-            option.setName('faction')
-                .setDescription('Choose a Faction')
-                .setRequired(false)
-                .addChoices(...logoOptions)),
-
-    new SlashCommandBuilder()
-        .setName('valentine')
-        .setDescription('Create a Valentine\'s Day card with your name'),
 
     // Community features
     new SlashCommandBuilder()
@@ -3671,14 +3325,6 @@ const commands = [
 
     // Utility commands
     new SlashCommandBuilder()
-        .setName('testrole')
-        .setDescription('Test role member fetching')
-        .addRoleOption(option => 
-            option.setName('role')
-                .setDescription('The role to test')
-                .setRequired(true)),
-
-    new SlashCommandBuilder()
         .setName('archive')
         .setDescription('Archive the current channel content')
         .addIntegerOption(option => 
@@ -3686,19 +3332,6 @@ const commands = [
                 .setDescription('Number of days to archive (leave empty for all messages)')
                 .setMinValue(1)
                 .setRequired(false)),
-
-    // Event commands
-    new SlashCommandBuilder()
-        .setName('setupcereal')
-        .setDescription('Set up the cereal bowl generator system (Admin only)'),
-
-    new SlashCommandBuilder()
-        .setName('reset_tree_event')
-        .setDescription('Reset the Forest Day tree event (Admin only)'),
-
-    new SlashCommandBuilder()
-        .setName('tree_status')
-        .setDescription('Check the status of the Forest Day tree event'),
 
     // Admin commands
     new SlashCommandBuilder()
@@ -3856,9 +3489,8 @@ const commands = [
 function verifyCommands() {
     const definedCommands = commands.map(cmd => cmd.name);
     const handledCommands = [
-        'equipment', 'equip', 'unequip', 'inventory', 'trade', 'convert', 'gacha',
-        'faction', 'valentine', 'poll', 'raffle', 'testrole', 'archive',
-        'setupcereal', 'reset_tree_event', 'tree_status',
+        'equipment', 'equip', 'unequip', 'inventory', 'trade', 'convert',
+        'poll', 'raffle', 'archive',
         'admin_items', 'admin_inventory', 'admin_update', 'admin_searchitem',
         'admin_item', 'admin_give', 'admin_stats', 'admin_leaderboard', 'setupshops'
     ];
@@ -4420,101 +4052,6 @@ async function handleConvertCommand(interaction) {
 }
 
 // ============================================================================
-// GACHA SYSTEM HANDLER
-// ============================================================================
-
-// Handle gacha ball opening
-async function handleGachaCommand(interaction) {
-    try {
-        await interaction.deferReply();
-
-        console.log(`🎰 Processing gacha: ${interaction.user.id} opening gacha ball`);
-
-        // Get correct item ID from waterlily_items table
-        const gachaItemId = await new Promise((resolve, reject) => {
-            db.get('SELECT id FROM waterlily_items WHERE LOWER(name) = ?', ['gacha ball'], (err, row) => {
-                if (err) reject(err);
-                else resolve(row?.id);
-            });
-        });
-
-        if (!gachaItemId) {
-            await interaction.editReply('❌ Error: Gacha Ball item not found in the system.');
-            return;
-        }
-
-        // Check if user has a gacha ball with the correct item ID
-        const inventory = await new Promise((resolve, reject) => {
-            db.get(
-                'SELECT quantity FROM user_inventory WHERE Discord = ? AND item_id = ? AND shop_type = ?',
-                [interaction.user.id, gachaItemId, 'waterlily'],
-                (err, row) => {
-                    if (err) reject(err);
-                    else resolve(row);
-                }
-            );
-        });
-
-        if (!inventory || inventory.quantity < 1) {
-            await interaction.editReply('❌ You do not have any Gacha Balls to open!');
-            return;
-        }
-
-        // Remove gacha ball from inventory using transactions
-        await new Promise((resolve, reject) => {
-            db.run('BEGIN TRANSACTION');
-            db.run(
-                'UPDATE user_inventory SET quantity = quantity - 1 WHERE Discord = ? AND item_id = ? AND shop_type = ?',
-                [interaction.user.id, gachaItemId, 'waterlily'],
-                (err) => {
-                    if (err) {
-                        db.run('ROLLBACK');
-                        reject(err);
-                        return;
-                    }
-                    db.run('DELETE FROM user_inventory WHERE quantity <= 0');
-                    db.run('COMMIT', (err) => {
-                        if (err) {
-                            db.run('ROLLBACK');
-                            reject(err);
-                            return;
-                        }
-                        resolve();
-                    });
-                }
-            );
-        });
-
-        // Select and award prize
-        const prize = selectGachaPrize();
-        
-        const embed = new EmbedBuilder()
-            .setColor(0xFF9933)
-            .setTitle('🎁 Gacha Ball Opening')
-            .setDescription(
-                prize.name === 'Nothing' 
-                    ? 'The box was empty... Better luck next time!'
-                    : `Congratulations! You received ${prize.emoji} **${prize.name}**!`
-            )
-            .setImage('https://i.ibb.co/99MCQtb/bd60427c-77b9-44a6-9933-a1d0224dcfcc.jpg')
-            .setTimestamp();
-
-        await interaction.editReply({ embeds: [embed] });
-
-        // Log the gacha pull
-        const logChannel = interaction.client.channels.cache.get(NOTIFICATION_CHANNEL);
-        if (logChannel) {
-            await logChannel.send(
-                `🎰 ${interaction.user.tag} opened a Gacha Ball and received ${prize.emoji} **${prize.name}**!`
-            );
-        }
-    } catch (error) {
-        console.error('❌ Error in gacha command:', error);
-        await interaction.editReply('❌ An error occurred while opening the Gacha Ball.');
-    }
-}
-
-// ============================================================================
 // POLL SYSTEM
 // ============================================================================
 
@@ -4811,221 +4348,6 @@ async function handlePollEnd(message, poll, cancelled = false) {
     });
 
     activePolls.delete(message.id);
-}
-
-// ============================================================================
-// SPECIAL FEATURE HANDLERS
-// ============================================================================
-
-// Handle Valentine's card creation
-async function handleValentineCommand(interaction) {
-    try {
-        await interaction.deferReply();
-        console.log(`💝 Creating valentine card for: ${interaction.user.username}`);
-        
-        // Get user's Discord name
-        const userName = interaction.user.username;
-        console.log(`👤 User name: ${userName}`);
-        
-        // Create canvas
-        console.log('🎨 Creating canvas...');
-        const canvas = Canvas.createCanvas(1701, 1299);
-        const ctx = canvas.getContext('2d');
-        
-        // Get list of all template files
-        const templateFiles = fs.readdirSync('./valentine_templates').filter(file => 
-            file.endsWith('.png') || file.endsWith('.jpg')
-        );
-        console.log(`📁 Available templates: ${templateFiles.length}`);
-        
-        if (templateFiles.length === 0) {
-            throw new Error('No template files found');
-        }
-        
-        // Pick random template
-        const randomTemplate = templateFiles[Math.floor(Math.random() * templateFiles.length)];
-        console.log(`🎲 Selected template: ${randomTemplate}`);
-        
-        // Load template
-        console.log('📷 Loading template...');
-        const template = await Canvas.loadImage(`./valentine_templates/${randomTemplate}`);
-        console.log('✅ Template loaded successfully');
-        
-        ctx.drawImage(template, 0, 0, canvas.width, canvas.height);
-        
-        // Add user's name with dynamic positioning
-        console.log('✍️ Adding name...');
-        ctx.font = 'bold 68px "HandWritten"';
-        ctx.fillStyle = '#030202';  // Dark color
-        
-        // Calculate position adjustment based on name length
-        const baseX = 780;  // Base X coordinate for names of 5 characters or less
-        const baseLength = 5;  // Base character length
-        const adjustmentPerChar = 12;  // Pixels to move left per extra character
-        
-        // Calculate new X position
-        let xPosition = baseX;
-        if (userName.length > baseLength) {
-            // Move left by adjustmentPerChar pixels for each character over baseLength
-            const extraChars = userName.length - baseLength;
-            xPosition = baseX - (extraChars * adjustmentPerChar);
-        }
-        
-        console.log(`📏 Username length: ${userName.length}, X position: ${xPosition}`);
-        ctx.fillText(userName, xPosition, 553);  // Dynamic X coordinate
-        
-        // Create attachment
-        console.log('📎 Creating attachment...');
-        const buffer = canvas.toBuffer('image/png');
-        const attachment = new AttachmentBuilder(buffer, { 
-            name: 'valentine-card.png' 
-        });
-        console.log('✅ Attachment created successfully');
-        
-        // Send the card
-        console.log('📤 Sending reply...');
-        await interaction.editReply({ files: [attachment] });
-        console.log('💝 Valentine card sent successfully');
-        
-    } catch (error) {
-        console.error('❌ Detailed error:', error);
-        console.error('📚 Error stack:', error.stack);
-        await interaction.editReply({
-            content: '❌ There was an error creating your Valentine card! Please try again later.',
-            ephemeral: true
-        });
-    }
-}
-
-// Handle faction logo addition to profile picture
-async function handleFactionCommand(interaction) {
-    try {
-        await interaction.deferReply();
-        console.log(`🏴 Processing faction command for: ${interaction.user.username}`);
-        
-        const member = interaction.member;
-        const avatarURL = member.displayAvatarURL({ extension: 'png', size: 1024 });
-        
-        // Fetch user avatar
-        const avatarResponse = await request(avatarURL);
-        const arrayBuffer = await avatarResponse.body.arrayBuffer();
-        const avatar = await Canvas.loadImage(Buffer.from(arrayBuffer));
-        
-        // Create canvas
-        const canvasSize = 1024;
-        const canvas = Canvas.createCanvas(canvasSize, canvasSize);
-        const ctx = canvas.getContext('2d');
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = 'high';
-        
-        // Create circular mask for avatar
-        ctx.beginPath();
-        ctx.arc(canvasSize / 2, canvasSize / 2, canvasSize / 2, 0, Math.PI * 2, true);
-        ctx.closePath();
-        ctx.clip();
-        ctx.drawImage(avatar, 0, 0, canvasSize, canvasSize);
-        ctx.restore();
-        ctx.save();
-        
-        // Select logo
-        let selectedLogo = interaction.options.getString('faction') || 
-            logoOptions[Math.floor(Math.random() * logoOptions.length)].value;
-        
-        const logo = await Canvas.loadImage(`./${selectedLogo}`);
-        ctx.drawImage(logo, 0, 0, canvasSize, canvasSize);
-        
-        // Create attachment
-        const buffer = canvas.toBuffer('image/png', { quality: 0.92, compressionLevel: 9 });
-        const attachment = new AttachmentBuilder(buffer, { name: 'profile-with-logo.png' });
-        
-        const selectedStyle = logoOptions.find(option => option.value === selectedLogo)?.name || 'Random';
-        await interaction.editReply({ 
-            content: `🏴 Here's your profile picture with the **${selectedStyle}** faction emblem!`,
-            files: [attachment] 
-        });
-        
-    } catch (error) {
-        console.error('❌ Error in faction command:', error);
-        await interaction.editReply('❌ An error occurred while processing your request.');
-    }
-}
-
-// Handle test role command for debugging
-async function handleTestRoleCommand(interaction) {
-    try {
-        await interaction.deferReply({ ephemeral: true });
-        
-        const role = interaction.options.getRole('role');
-        const guild = interaction.guild;
-        
-        console.log(`🧪 Testing role: ${role.name} (${role.id})`);
-        
-        // Method 1: Basic fetch
-        const basicMembers = await guild.members.fetch({ force: true });
-        const basicEligible = basicMembers.filter(member => member.roles.cache.has(role.id));
-        
-        // Method 2: Role-specific fetch
-        const roleWithMembers = await guild.roles.fetch(role.id, { force: true, withMembers: true });
-        
-        // Method 3: Individual member fetches
-        const membersFromRole = await Promise.all(
-            Array.from(roleWithMembers.members.values()).map(async (member) => {
-                try {
-                    return await guild.members.fetch({ user: member.id, force: true });
-                } catch (error) {
-                    console.error(`❌ Failed to fetch member ${member.id}:`, error);
-                    return null;
-                }
-            })
-        );
-        const individualEligible = membersFromRole.filter(member => member !== null);
-        
-        // Create detailed response embed
-        const embed = new EmbedBuilder()
-            .setColor(0x00AE86)
-            .setTitle('🧪 Role Member Fetch Test Results')
-            .setDescription(`Testing member fetching for role: **${role.name}**`)
-            .addFields(
-                {
-                    name: 'Method 1: Basic Fetch',
-                    value: `Found ${basicEligible.size} members`,
-                    inline: true
-                },
-                {
-                    name: 'Method 2: Role Fetch',
-                    value: `Found ${roleWithMembers.members.size} members`,
-                    inline: true
-                },
-                {
-                    name: 'Method 3: Individual Fetches',
-                    value: `Found ${individualEligible.length} members`,
-                    inline: true
-                }
-            )
-            .addFields({
-                name: 'Member List (First 20)',
-                value: individualEligible
-                    .slice(0, 20)
-                    .map(member => `${member.user.tag}`)
-                    .join('\n') || 'No members found'
-            });
-        
-        // Send results
-        await interaction.editReply({ embeds: [embed] });
-        
-        // Log full results to console for debugging
-        console.log('🧪 Test Results:', {
-            roleId: role.id,
-            roleName:role.name,
-            basicFetchCount: basicEligible.size,
-            roleFetchCount: roleWithMembers.members.size,
-            individualFetchCount: individualEligible.length,
-            totalGuildMembers: guild.memberCount
-        });
-    } catch (error) {
-        console.error('❌ Error in test role command:', error);
-        await interaction.editReply('❌ An error occurred while testing role member fetching.');
-    }
 }
 
 // ============================================================================
@@ -5641,16 +4963,8 @@ const commandHandlers = {
     'convert': handleConvertCommand,
     
     // Game Features
-    'gacha': handleGachaCommand,
     'poll': handlePollCommand,
     'raffle': handleRaffleCreate,
-    
-    // Special Features
-    'valentine': handleValentineCommand,
-    'faction': handleFactionCommand,
-    
-    // Utility
-    'testrole': handleTestRoleCommand,
     
     // Admin Commands
     'admin_give': handleAdminGive,
@@ -5988,8 +5302,8 @@ function scheduleDailyRewards(client, guildId, roleId, dailyRewardsChannelId) {
 function scheduleGoodMorningMessages(client) {
     cron.schedule('10 6 * * *', () => {
         const randomMessage = goodMorningMessages[Math.floor(Math.random() * goodMorningMessages.length)];
-        const channel = client.channels.cache.get(DM_FORWARD_CHANNEL_ID);
-        
+        const channel = client.channels.cache.get(NOTIFICATION_CHANNEL);
+
         if (channel) {
             channel.send(randomMessage)
                 .then(() => console.log('☀️ Good morning message sent successfully'))
@@ -6130,19 +5444,7 @@ client.on('ready', async () => {
     try {
         // Set bot activity
         client.user.setActivity('Serving Tea & Mochi 🍡', { type: ActivityType.Custom });
-        
-        // Run database migration
-        await migrateDatabase();
-        console.log('✅ Database migration completed');
-        
-        // Add shop_type column
-        await addShopTypeColumn();
-        console.log('✅ Shop type column migration completed');
-        
-        // Clean up equipment database
-        await cleanupEquippedItems();
-        console.log('✅ Equipment database cleaned up');
-        
+
         // Initialize systems
         await Promise.all([
             updateValidButtonIds(),
@@ -6281,11 +5583,6 @@ if (interaction.isChatInputCommand()) {
             await handleEquipmentShopCommand(interaction);
             break;
 
-        case 'faction':
-            if (!interaction.deferred) await interaction.deferReply();
-            await dokyofyCommand(interaction);
-            break;
-
         case 'poll':
             await handlePollCommand(interaction);
             break;
@@ -6318,32 +5615,8 @@ if (interaction.isChatInputCommand()) {
             await handleConvertCommand(interaction);
             break;
 
-        case 'gacha':
-            await handleGachaCommand(interaction);
-            break;
-
         case 'archive':
             await handleArchiveCommand(interaction);
-            break;
-
-        case 'testrole':
-            await handleTestRoleCommand(interaction);
-            break;
-
-        case 'valentine':
-            await handleValentineCommand(interaction);
-            break;
-
-        case 'tree_status':
-            await handleTreeStatusCommand(interaction);
-            break;
-
-        case 'reset_tree_event':
-            await handleResetTreeEventCommand(interaction);
-            break;
-
-        case 'setupcereal':
-            await handleSetupCerealCommand(interaction);
             break;
 
         // Admin Commands
@@ -6436,12 +5709,6 @@ if (interaction.isChatInputCommand()) {
 client.on('messageCreate', async message => {
     // Ignore bot messages
     if (message.author.bot) return;
-    
-
-    if (message.channel.type === ChannelType.DM) {
-        await handleDMForwarding(message);
-        return;
-    }
 
     // Handle direct memory commands
     if (message.content.startsWith('!remember ')) {
@@ -6459,7 +5726,7 @@ client.on('messageCreate', async message => {
         await handleMemoryCommands(message);
         return;
     }
-    
+
     // Handle random chat admin commands
     if (message.content.startsWith('!randomchat ')) {
         // Only admins can use these commands
@@ -6467,10 +5734,10 @@ client.on('messageCreate', async message => {
             await message.reply("❌ You don't have permission to use this command.");
             return;
         }
-        
+
         const args = message.content.slice('!randomchat '.length).split(' ');
         const subCommand = args[0];
-        
+
         switch (subCommand) {
             case 'status':
                 const embed = new EmbedBuilder()
@@ -6483,7 +5750,7 @@ client.on('messageCreate', async message => {
                     );
                 await message.reply({ embeds: [embed] });
                 break;
-                
+
             case 'test':
                 try {
                     const testMessage = await generateRandomMessage(message.channel);
@@ -6492,10 +5759,13 @@ client.on('messageCreate', async message => {
                     await message.reply('❌ Error generating test message.');
                 }
                 break;
+
+            default:
+                await message.reply('❌ Unknown subcommand. Use `!randomchat status` or `!randomchat test`');
         }
         return;
     }
-    
+
     // Handle tweet links in designated channel
     if (message.channel.id === TWEET_CHANNEL_ID) {
         const match = message.content.match(/https:\/\/(twitter\.com|x\.com)\/[^\s]+/);
