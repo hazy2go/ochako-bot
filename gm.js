@@ -1763,6 +1763,100 @@ function scheduleContextCleanup() {
     }, ONE_DAY);
 }
 
+// Check for birthdays daily and send wishes
+function scheduleBirthdayCheck() {
+    const ONE_HOUR = 60 * 60 * 1000;
+
+    // Check every hour (in case bot restarts, won't miss birthdays)
+    setInterval(async () => {
+        try {
+            const birthdays = await checkTodaysBirthdays();
+
+            if (birthdays && birthdays.length > 0) {
+                console.log(`🎂 Found ${birthdays.length} birthday(s) today!`);
+
+                for (const profile of birthdays) {
+                    await sendBirthdayWish(profile.user_id, profile.username);
+                    await markBirthdayCelebrated(profile.user_id);
+                }
+            }
+        } catch (error) {
+            console.error('❌ Error checking birthdays:', error);
+        }
+    }, ONE_HOUR);
+
+    // Also check immediately on startup
+    setTimeout(async () => {
+        try {
+            const birthdays = await checkTodaysBirthdays();
+            if (birthdays && birthdays.length > 0) {
+                console.log(`🎂 Found ${birthdays.length} birthday(s) today on startup!`);
+                for (const profile of birthdays) {
+                    await sendBirthdayWish(profile.user_id, profile.username);
+                    await markBirthdayCelebrated(profile.user_id);
+                }
+            }
+        } catch (error) {
+            console.error('❌ Error checking birthdays on startup:', error);
+        }
+    }, 5000); // Check 5 seconds after bot starts
+}
+
+// Send birthday wish to user
+async function sendBirthdayWish(userId, username) {
+    try {
+        // Try to get user from any guild
+        const guilds = client.guilds.cache;
+        let user = null;
+
+        for (const guild of guilds.values()) {
+            try {
+                const member = await guild.members.fetch(userId);
+                if (member) {
+                    user = member.user;
+                    break;
+                }
+            } catch (e) {
+                // User not in this guild, try next
+            }
+        }
+
+        if (!user) {
+            console.log(`❌ Could not find user ${userId} to send birthday wish`);
+            return;
+        }
+
+        // Generate personalized birthday message using AI
+        const birthdayPrompt = `Generate a warm, friendly birthday message for ${username}.
+        Keep it short (1-2 sentences), casual, and genuine.
+        Use Ochako's personality (16-year-old girl, sassy but kind).
+        Examples: "happy birthday! hope you have an awesome day 🎉" or "omg it's your birthday! have the best day ever 🎂"
+        Don't use their name in the message.`;
+
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: [
+                { role: 'system', content: personality },
+                { role: 'user', content: birthdayPrompt }
+            ],
+            temperature: 1.0,
+            max_tokens: 100
+        });
+
+        const birthdayMessage = response.choices[0].message.content;
+
+        // Send DM
+        await user.send(birthdayMessage);
+        console.log(`🎂 Sent birthday wish to ${username}`);
+
+        // Store as a special memory
+        await storeUserFact(userId, `Birthday celebrated on ${new Date().toLocaleDateString()}`, 'event', 1.0, 'birthday_wish');
+
+    } catch (error) {
+        console.error(`❌ Error sending birthday wish to ${username}:`, error);
+    }
+}
+
 // ============================================================================
 // RANDOM CHAT FUNCTIONS
 // ============================================================================
@@ -6366,7 +6460,8 @@ client.on('ready', async () => {
         
         scheduleGoodMorningMessages(client);
         scheduleContextCleanup();
-        
+        scheduleBirthdayCheck(); // Phase 4: Proactive birthday wishes
+
         console.log('🔄 Starting random conversation scheduler...');
         scheduleRandomMessage();
         
@@ -7581,12 +7676,26 @@ async function handleAI(message) {
             { role: 'user', content: `${message.author.username}: ${query}` }
         ];
 
+        // PHASE 4: Dynamic response length based on relationship
+        // Close friends get longer, more detailed responses
+        // New people get shorter, more casual responses
+        let maxTokens = 150; // Default
+        if (relationshipContext) {
+            if (relationshipContext.relationshipLevel === 'close friend') {
+                maxTokens = 250; // Longer responses for close friends
+            } else if (relationshipContext.relationshipLevel === 'friend') {
+                maxTokens = 200; // Medium responses for friends
+            } else if (relationshipContext.relationshipLevel === 'new person') {
+                maxTokens = 100; // Very short for new people
+            }
+        }
+
         // Call OpenAI API with higher temperature for casual, natural responses
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
             messages: messages,
             temperature: 1.1, // Higher for more natural, varied responses
-            max_tokens: 150, // Shorter responses feel more natural and conversational
+            max_tokens: maxTokens, // Dynamic based on relationship depth
             presence_penalty: 0.6, // Encourages different phrasing
             frequency_penalty: 0.3, // Reduces repetitive patterns
         });
