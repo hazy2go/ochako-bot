@@ -1178,6 +1178,221 @@ async function getRelationshipContext(userId) {
 }
 
 // ============================================================================
+// PHASE 2: PROACTIVE MEMORY & CURIOSITY SYSTEM
+// ============================================================================
+
+// Get relevant old memories that might be worth bringing up
+async function getRelevantMemories(userId, currentMessage, limit = 3) {
+    return new Promise((resolve, reject) => {
+        const lowerMessage = currentMessage.toLowerCase();
+
+        // Get all memories and rank by relevance
+        aiDb.all(
+            `SELECT m.*,
+                    (julianday('now') - julianday(m.last_accessed / 1000, 'unixepoch')) as days_since_accessed
+             FROM user_memory m
+             WHERE m.user_id = ?
+             ORDER BY days_since_accessed DESC, m.confidence DESC
+             LIMIT 20`,
+            [userId],
+            async (err, memories) => {
+                if (err) return reject(err);
+
+                if (!memories || memories.length === 0) {
+                    return resolve([]);
+                }
+
+                // Score memories based on relevance to current conversation
+                const scoredMemories = memories.map(memory => {
+                    let score = 0;
+                    const memoryWords = memory.fact.toLowerCase().split(/\s+/);
+                    const messageWords = lowerMessage.split(/\s+/);
+
+                    // Check for word overlap
+                    for (const word of memoryWords) {
+                        if (word.length > 3 && messageWords.includes(word)) {
+                            score += 2;
+                        }
+                    }
+
+                    // Boost score for old, unaccessed memories (bring up forgotten things)
+                    if (memory.days_since_accessed > 7) score += 1;
+                    if (memory.days_since_accessed > 30) score += 2;
+
+                    // Boost score based on confidence
+                    score += memory.confidence;
+
+                    return { ...memory, relevance_score: score };
+                });
+
+                // Return top relevant memories
+                const relevant = scoredMemories
+                    .filter(m => m.relevance_score > 0.5)
+                    .sort((a, b) => b.relevance_score - a.relevance_score)
+                    .slice(0, limit);
+
+                resolve(relevant);
+            }
+        );
+    });
+}
+
+// Generate follow-up questions based on memories
+async function generateFollowUpContext(userId, username) {
+    return new Promise((resolve, reject) => {
+        // Get recent memories that might need follow-up
+        const twoDaysAgo = Date.now() - (2 * 24 * 60 * 60 * 1000);
+        const twoWeeksAgo = Date.now() - (14 * 24 * 60 * 60 * 1000);
+
+        aiDb.all(
+            `SELECT * FROM user_memory
+             WHERE user_id = ?
+             AND created_at > ?
+             AND created_at < ?
+             AND (category = 'preference' OR category = 'history' OR category = 'trait')
+             ORDER BY created_at DESC
+             LIMIT 5`,
+            [userId, twoWeeksAgo, twoDaysAgo],
+            (err, memories) => {
+                if (err) return reject(err);
+
+                if (!memories || memories.length === 0) {
+                    return resolve(null);
+                }
+
+                // Pick a random memory to ask about
+                const memory = memories[Math.floor(Math.random() * memories.length)];
+                const daysSince = Math.floor((Date.now() - memory.created_at) / (1000 * 60 * 60 * 24));
+
+                resolve({
+                    fact: memory.fact,
+                    daysSince,
+                    category: memory.category,
+                    suggestion: `You mentioned something ${daysSince} day(s) ago about: "${memory.fact}". Consider asking how it's going or bringing it up naturally.`
+                });
+            }
+        );
+    });
+}
+
+// Detect when Ochako should be curious and ask questions
+function shouldShowCuriosity(message) {
+    const lowerMessage = message.toLowerCase();
+
+    // Things that should trigger curiosity
+    const curiosityTriggers = [
+        /playing (\w+)/i,           // "playing valorant"
+        /watching (\w+)/i,          // "watching demon slayer"
+        /reading (\w+)/i,           // "reading a book"
+        /learning (\w+)/i,          // "learning python"
+        /got a new (\w+)/i,         // "got a new guitar"
+        /started (\w+)/i,           // "started working out"
+        /joined (\w+)/i,            // "joined a gym"
+        /bought (\w+)/i,            // "bought a car"
+        /visiting (\w+)/i,          // "visiting paris"
+        /tried (\w+)/i,             // "tried sushi"
+    ];
+
+    for (const pattern of curiosityTriggers) {
+        if (pattern.test(lowerMessage)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// Extract topics she doesn't know about yet
+async function detectUnknownTopics(userId, message) {
+    const lowerMessage = message.toLowerCase();
+
+    // Common topics that might be mentioned
+    const topicPatterns = {
+        games: /(?:playing|play) ([\w\s]+?)(?:\s|$|,|\.|with|on)/i,
+        shows: /(?:watching|watch) ([\w\s]+?)(?:\s|$|,|\.|on)/i,
+        hobbies: /(?:into|enjoy|love|like) ([\w\s]+?)(?:\s|$|,|\.)/i,
+        places: /(?:visiting|visited|going to|went to) ([\w\s]+?)(?:\s|$|,|\.)/i,
+        food: /(?:eating|ate|tried|trying) ([\w\s]+?)(?:\s|$|,|\.)/i
+    };
+
+    const unknownTopics = [];
+
+    for (const [category, pattern] of Object.entries(topicPatterns)) {
+        const match = message.match(pattern);
+        if (match && match[1]) {
+            const topic = match[1].trim();
+
+            // Check if she already knows about this
+            const exists = await new Promise((resolve) => {
+                aiDb.get(
+                    'SELECT * FROM user_memory WHERE user_id = ? AND fact LIKE ?',
+                    [userId, `%${topic}%`],
+                    (err, row) => resolve(!!row)
+                );
+            });
+
+            if (!exists && topic.length > 2) {
+                unknownTopics.push({ category, topic });
+            }
+        }
+    }
+
+    return unknownTopics;
+}
+
+// Generate curiosity prompt for unknown topics
+function getCuriosityPrompt(unknownTopics) {
+    if (unknownTopics.length === 0) return '';
+
+    const topic = unknownTopics[0]; // Focus on first unknown thing
+
+    return `\n\nNOTE: They mentioned "${topic.topic}" which you don't know about. You can:
+- Ask what it is (if genuinely curious)
+- Show mild interest naturally
+- Or just acknowledge it casually
+Don't force it - only ask if it flows naturally with your personality!`;
+}
+
+// Track conversation patterns and topics
+async function analyzeConversationPatterns(userId) {
+    return new Promise((resolve, reject) => {
+        // Get recent conversation timeline
+        const threeDaysAgo = Date.now() - (3 * 24 * 60 * 60 * 1000);
+
+        aiDb.all(
+            `SELECT * FROM interaction_timeline
+             WHERE user_id = ?
+             AND timestamp > ?
+             ORDER BY timestamp DESC
+             LIMIT 50`,
+            [userId, threeDaysAgo],
+            (err, interactions) => {
+                if (err) return reject(err);
+
+                if (!interactions || interactions.length === 0) {
+                    return resolve(null);
+                }
+
+                // Analyze patterns
+                const totalInteractions = interactions.length;
+                const timeSpan = interactions[0].timestamp - interactions[interactions.length - 1].timestamp;
+                const averageGap = timeSpan / totalInteractions;
+
+                // Determine if user is very active recently
+                const isVeryActive = totalInteractions > 20 && averageGap < (2 * 60 * 60 * 1000); // More than 20 messages, avg gap < 2 hours
+
+                resolve({
+                    totalInteractions,
+                    averageGap,
+                    isVeryActive,
+                    recentEngagement: totalInteractions > 10 ? 'high' : (totalInteractions > 3 ? 'medium' : 'low')
+                });
+            }
+        );
+    });
+}
+
+// ============================================================================
 // MAINTENANCE FUNCTIONS
 // ============================================================================
 
@@ -6938,6 +7153,32 @@ async function handleAI(message) {
             if (relationshipContext.shouldGreet) {
                 userContext += `\n- NOTE: You haven't talked to them in a while, acknowledge this naturally!`;
             }
+        }
+
+        // PHASE 2: Proactive Memory & Curiosity
+
+        // Check for relevant old memories to bring up
+        const relevantMemories = await getRelevantMemories(message.author.id, query, 2);
+        if (relevantMemories.length > 0) {
+            userContext += `\n\nRelevant past memories:`;
+            relevantMemories.forEach(mem => {
+                const daysAgo = Math.floor((Date.now() - mem.last_accessed) / (1000 * 60 * 60 * 24));
+                userContext += `\n- ${mem.fact} (mentioned ${daysAgo} days ago)`;
+            });
+            userContext += `\n(You can reference these naturally if relevant to the conversation)`;
+        }
+
+        // Check for follow-up opportunities
+        const followUp = await generateFollowUpContext(message.author.id, message.author.username);
+        if (followUp && Math.random() < 0.3) { // 30% chance to bring up old topic
+            userContext += `\n\n💡 Follow-up opportunity: ${followUp.suggestion}`;
+        }
+
+        // Detect unknown topics (curiosity system)
+        const unknownTopics = await detectUnknownTopics(message.author.id, query);
+        const curiosityPrompt = getCuriosityPrompt(unknownTopics);
+        if (curiosityPrompt) {
+            userContext += curiosityPrompt;
         }
 
         // Add temporal awareness to system prompt
