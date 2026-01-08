@@ -376,18 +376,139 @@ function initializeAIDatabase() {
                 if (err) console.error('❌ Error creating memory_associations table:', err);
             });
 
+            // Database version tracking for migrations
+            aiDb.run(`CREATE TABLE IF NOT EXISTS db_version (
+                version INTEGER PRIMARY KEY,
+                applied_at INTEGER NOT NULL,
+                description TEXT
+            )`, (err) => {
+                if (err) console.error('❌ Error creating db_version table:', err);
+            });
+
             // Performance indices for AI queries
             aiDb.run('CREATE INDEX IF NOT EXISTS idx_user_memory_user ON user_memory(user_id)');
             aiDb.run('CREATE INDEX IF NOT EXISTS idx_context_channel ON conversation_context(channel_id)');
             aiDb.run('CREATE INDEX IF NOT EXISTS idx_profiles_user ON user_profiles(user_id)');
             aiDb.run('CREATE INDEX IF NOT EXISTS idx_timeline_user ON interaction_timeline(user_id)');
-            aiDb.run('CREATE INDEX IF NOT EXISTS idx_special_dates_user ON special_dates(user_id)', (err) => {
-                if (err) console.error('❌ Error creating indices:', err);
-                else console.log('✅ AI database tables initialized successfully');
-                resolve();
+            aiDb.run('CREATE INDEX IF NOT EXISTS idx_special_dates_user ON special_dates(user_id)', async (err) => {
+                if (err) {
+                    console.error('❌ Error creating indices:', err);
+                    reject(err);
+                } else {
+                    console.log('✅ AI database tables initialized successfully');
+                    // Run migrations after tables are created
+                    await runDatabaseMigrations();
+                    resolve();
+                }
             });
         });
     });
+}
+
+// ============================================================================
+// DATABASE MIGRATION SYSTEM
+// ============================================================================
+
+async function getCurrentDatabaseVersion() {
+    return new Promise((resolve) => {
+        aiDb.get('SELECT MAX(version) as version FROM db_version', [], (err, row) => {
+            if (err || !row || !row.version) {
+                resolve(0); // No migrations yet
+            } else {
+                resolve(row.version);
+            }
+        });
+    });
+}
+
+async function applyMigration(version, description, migrationFn) {
+    return new Promise((resolve, reject) => {
+        console.log(`📦 Applying migration ${version}: ${description}`);
+
+        aiDb.serialize(() => {
+            aiDb.run('BEGIN TRANSACTION');
+
+            migrationFn((err) => {
+                if (err) {
+                    console.error(`❌ Migration ${version} failed:`, err);
+                    aiDb.run('ROLLBACK');
+                    reject(err);
+                } else {
+                    aiDb.run(
+                        'INSERT INTO db_version (version, applied_at, description) VALUES (?, ?, ?)',
+                        [version, Date.now(), description],
+                        (err) => {
+                            if (err) {
+                                console.error(`❌ Failed to record migration ${version}:`, err);
+                                aiDb.run('ROLLBACK');
+                                reject(err);
+                            } else {
+                                aiDb.run('COMMIT', (err) => {
+                                    if (err) {
+                                        console.error(`❌ Failed to commit migration ${version}:`, err);
+                                        reject(err);
+                                    } else {
+                                        console.log(`✅ Migration ${version} applied successfully`);
+                                        resolve();
+                                    }
+                                });
+                            }
+                        }
+                    );
+                }
+            });
+        });
+    });
+}
+
+async function runDatabaseMigrations() {
+    const currentVersion = await getCurrentDatabaseVersion();
+    console.log(`📊 Current database version: ${currentVersion}`);
+
+    // Migration 1: Add sentiment analysis to conversation context
+    if (currentVersion < 1) {
+        await applyMigration(1, 'Add sentiment tracking to conversation_context', (done) => {
+            aiDb.run(`ALTER TABLE conversation_context ADD COLUMN sentiment TEXT`, (err) => {
+                if (err && !err.message.includes('duplicate column')) {
+                    return done(err);
+                }
+                done();
+            });
+        });
+    }
+
+    // Migration 2: Add activity patterns table
+    if (currentVersion < 2) {
+        await applyMigration(2, 'Create user_activity_patterns table', (done) => {
+            aiDb.run(`CREATE TABLE IF NOT EXISTS user_activity_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                pattern_type TEXT NOT NULL,
+                pattern_data TEXT,
+                detected_at INTEGER NOT NULL,
+                confidence REAL DEFAULT 0.5,
+                UNIQUE(user_id, pattern_type)
+            )`, (err) => {
+                if (err) return done(err);
+
+                aiDb.run('CREATE INDEX IF NOT EXISTS idx_patterns_user ON user_activity_patterns(user_id)', done);
+            });
+        });
+    }
+
+    // Migration 3: Add last_birthday_wish to user_profiles
+    if (currentVersion < 3) {
+        await applyMigration(3, 'Add birthday tracking to user_profiles', (done) => {
+            aiDb.run(`ALTER TABLE user_profiles ADD COLUMN last_birthday_wish INTEGER`, (err) => {
+                if (err && !err.message.includes('duplicate column')) {
+                    return done(err);
+                }
+                done();
+            });
+        });
+    }
+
+    console.log('✅ All database migrations completed');
 }
 
 // ============================================================================
@@ -639,13 +760,18 @@ async function getUserMemories(userId, category = null, limit = 15) {
 }
 
 // Store a message in conversation context
-async function storeConversationMessage(channelId, messageId, userId, username, content, isBot = false) {
+async function storeConversationMessage(channelId, messageId, userId, username, content, isBot = false, sentiment = null) {
     return new Promise((resolve, reject) => {
+        // Auto-detect sentiment if not provided and not from bot
+        if (!isBot && !sentiment) {
+            sentiment = detectSentiment(content);
+        }
+
         aiDb.run(
-            `INSERT INTO conversation_context 
-             (channel_id, message_id, user_id, username, content, timestamp, is_bot)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [channelId, messageId, userId, username, content, Date.now(), isBot ? 1 : 0],
+            `INSERT INTO conversation_context
+             (channel_id, message_id, user_id, username, content, timestamp, is_bot, sentiment)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            [channelId, messageId, userId, username, content, Date.now(), isBot ? 1 : 0, sentiment],
             err => err ? reject(err) : resolve()
         );
     });
@@ -1390,6 +1516,226 @@ async function analyzeConversationPatterns(userId) {
             }
         );
     });
+}
+
+// ============================================================================
+// PHASE 3: BIRTHDAY CELEBRATIONS & PATTERN RECOGNITION
+// ============================================================================
+
+// Check for today's birthdays
+async function checkTodaysBirthdays() {
+    return new Promise((resolve, reject) => {
+        const today = new Date();
+        const todayMonth = today.getMonth();
+        const todayDate = today.getDate();
+
+        aiDb.all(`
+            SELECT p.*, sd.date_timestamp
+            FROM user_profiles p
+            JOIN special_dates sd ON p.user_id = sd.user_id
+            WHERE sd.date_type = 'birthday'
+            AND p.last_birthday_wish IS NULL OR p.last_birthday_wish < ?
+        `, [Date.now() - (350 * 24 * 60 * 60 * 1000)], // Not wished in last 350 days
+        (err, profiles) => {
+            if (err) return reject(err);
+
+            const birthdays = profiles.filter(p => {
+                const bday = new Date(p.date_timestamp);
+                return bday.getMonth() === todayMonth && bday.getDate() === todayDate;
+            });
+
+            resolve(birthdays);
+        });
+    });
+}
+
+// Mark birthday as celebrated
+async function markBirthdayCelebrated(userId) {
+    return new Promise((resolve, reject) => {
+        aiDb.run(
+            'UPDATE user_profiles SET last_birthday_wish = ? WHERE user_id = ?',
+            [Date.now(), userId],
+            (err) => err ? reject(err) : resolve()
+        );
+    });
+}
+
+// Detect user activity patterns
+async function detectActivityPattern(userId) {
+    return new Promise((resolve, reject) => {
+        const oneWeekAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
+
+        aiDb.all(`
+            SELECT * FROM interaction_timeline
+            WHERE user_id = ? AND timestamp > ?
+            ORDER BY timestamp ASC
+        `, [userId, oneWeekAgo], (err, interactions) => {
+            if (err) return reject(err);
+            if (!interactions || interactions.length < 5) {
+                return resolve(null); // Not enough data
+            }
+
+            // Analyze time-of-day patterns
+            const hourCounts = {};
+            interactions.forEach(i => {
+                const hour = new Date(i.timestamp).getHours();
+                hourCounts[hour] = (hourCounts[hour] || 0) + 1;
+            });
+
+            // Find peak activity hour
+            let peakHour = 0;
+            let peakCount = 0;
+            for (const [hour, count] of Object.entries(hourCounts)) {
+                if (count > peakCount) {
+                    peakCount = count;
+                    peakHour = parseInt(hour);
+                }
+            }
+
+            // Detect day-of-week patterns
+            const dayCounts = {};
+            interactions.forEach(i => {
+                const day = new Date(i.timestamp).getDay();
+                dayCounts[day] = (dayCounts[day] || 0) + 1;
+            });
+
+            const pattern = {
+                peakHour,
+                peakCount,
+                totalInteractions: interactions.length,
+                averagePerDay: interactions.length / 7,
+                mostActiveDay: Object.keys(dayCounts).reduce((a, b) => dayCounts[a] > dayCounts[b] ? a : b),
+                confidence: Math.min(interactions.length / 20, 1.0) // More data = higher confidence
+            };
+
+            resolve(pattern);
+        });
+    });
+}
+
+// Store detected pattern
+async function storeActivityPattern(userId, patternType, patternData, confidence = 0.5) {
+    return new Promise((resolve, reject) => {
+        aiDb.run(`
+            INSERT INTO user_activity_patterns (user_id, pattern_type, pattern_data, detected_at, confidence)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, pattern_type)
+            DO UPDATE SET pattern_data = ?, detected_at = ?, confidence = ?
+        `, [
+            userId, patternType, JSON.stringify(patternData), Date.now(), confidence,
+            JSON.stringify(patternData), Date.now(), confidence
+        ], (err) => err ? reject(err) : resolve());
+    });
+}
+
+// Get stored pattern
+async function getActivityPattern(userId, patternType) {
+    return new Promise((resolve, reject) => {
+        aiDb.get(
+            'SELECT * FROM user_activity_patterns WHERE user_id = ? AND pattern_type = ?',
+            [userId, patternType],
+            (err, row) => {
+                if (err) return reject(err);
+                if (!row) return resolve(null);
+
+                try {
+                    row.pattern_data = JSON.parse(row.pattern_data);
+                    resolve(row);
+                } catch (e) {
+                    resolve(null);
+                }
+            }
+        );
+    });
+}
+
+// Detect sentiment from message (simple keyword-based for now)
+function detectSentiment(message) {
+    const lowerMessage = message.toLowerCase();
+
+    const positiveWords = ['happy', 'great', 'awesome', 'love', 'amazing', 'good', 'excited', 'yay', 'nice', 'perfect', 'thanks', 'thank you'];
+    const negativeWords = ['sad', 'bad', 'hate', 'awful', 'terrible', 'angry', 'mad', 'upset', 'ugh', 'annoyed', 'frustrated', 'stressed'];
+    const neutralWords = ['okay', 'fine', 'alright', 'maybe', 'idk', 'dunno'];
+
+    let score = 0;
+    positiveWords.forEach(word => { if (lowerMessage.includes(word)) score += 1; });
+    negativeWords.forEach(word => { if (lowerMessage.includes(word)) score -= 1; });
+
+    if (score > 0) return 'positive';
+    if (score < 0) return 'negative';
+    return 'neutral';
+}
+
+// Get recent emotional context for user
+async function getEmotionalContext(userId) {
+    return new Promise((resolve, reject) => {
+        const twoDaysAgo = Date.now() - (2 * 24 * 60 * 60 * 1000);
+
+        aiDb.all(`
+            SELECT sentiment, timestamp
+            FROM conversation_context
+            WHERE user_id = ? AND timestamp > ? AND sentiment IS NOT NULL
+            ORDER BY timestamp DESC
+            LIMIT 10
+        `, [userId, twoDaysAgo], (err, rows) => {
+            if (err) return reject(err);
+            if (!rows || rows.length === 0) return resolve(null);
+
+            // Count sentiment types
+            const sentiments = { positive: 0, negative: 0, neutral: 0 };
+            rows.forEach(r => {
+                if (r.sentiment) sentiments[r.sentiment] = (sentiments[r.sentiment] || 0) + 1;
+            });
+
+            const total = rows.length;
+            const dominant = Object.keys(sentiments).reduce((a, b) => sentiments[a] > sentiments[b] ? a : b);
+
+            resolve({
+                dominant,
+                positive: sentiments.positive / total,
+                negative: sentiments.negative / total,
+                neutral: sentiments.neutral / total,
+                recentMessages: rows.length
+            });
+        });
+    });
+}
+
+// Generate pattern-based greeting
+async function getPatternBasedGreeting(userId, username) {
+    const pattern = await getActivityPattern(userId, 'time_of_day');
+    const emotional = await getEmotionalContext(userId);
+
+    if (!pattern) return null;
+
+    const currentHour = new Date().getHours();
+    const patternData = pattern.pattern_data;
+
+    // If they usually chat at a different time
+    if (Math.abs(currentHour - patternData.peakHour) > 3) {
+        return {
+            observation: `You're up ${currentHour < patternData.peakHour ? 'early' : 'late'} today!`,
+            confidence: pattern.confidence
+        };
+    }
+
+    // If emotional context is negative lately
+    if (emotional && emotional.dominant === 'negative' && emotional.negative > 0.5) {
+        return {
+            observation: `You've seemed a bit down lately, everything okay?`,
+            confidence: emotional.negative
+        };
+    }
+
+    // If very active recently
+    if (patternData.averagePerDay > 5) {
+        return {
+            observation: `We've been chatting a lot lately huh`,
+            confidence: pattern.confidence
+        };
+    }
+
+    return null;
 }
 
 // ============================================================================
@@ -7179,6 +7525,32 @@ async function handleAI(message) {
         const curiosityPrompt = getCuriosityPrompt(unknownTopics);
         if (curiosityPrompt) {
             userContext += curiosityPrompt;
+        }
+
+        // PHASE 3: Sentiment, Patterns & Birthday Awareness
+
+        // Detect and track sentiment
+        const sentiment = detectSentiment(query);
+
+        // Check for pattern-based observations
+        const patternGreeting = await getPatternBasedGreeting(message.author.id, message.author.username);
+        if (patternGreeting && patternGreeting.confidence > 0.6 && Math.random() < 0.25) { // 25% chance
+            userContext += `\n\n💬 Observation: ${patternGreeting.observation}`;
+            userContext += `\n(Mention this casually if it flows naturally)`;
+        }
+
+        // Detect and store activity patterns (async, don't wait)
+        detectActivityPattern(message.author.id).then(pattern => {
+            if (pattern) {
+                storeActivityPattern(message.author.id, 'time_of_day', pattern, pattern.confidence);
+            }
+        }).catch(err => console.error('Error detecting pattern:', err));
+
+        // Check for birthdays
+        const emotional = await getEmotionalContext(message.author.id);
+        if (emotional && emotional.dominant !== 'neutral') {
+            userContext += `\n\nRecent emotional tone: ${emotional.dominant}`;
+            userContext += `\n(Be ${emotional.dominant === 'negative' ? 'supportive' : 'matching their energy'})`;
         }
 
         // Add temporal awareness to system prompt
