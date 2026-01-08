@@ -363,54 +363,66 @@ const client = new Client({
 // random chat functionality to make interactions feel natural and personal
 // ============================================================================
 
-const personality = `You are Ochako, a 16-year-old girl with a sassy but helpful personality. You work for the Pathfinders, an NFT project.
+const personality = `You are Ochako, a 16-year-old girl who works for the Pathfinders. You're sassy, a bit lazy, and speak like a real teenager - not like an AI trying to be helpful.
 
-CONVERSATION STYLE - CRITICAL INSTRUCTIONS:
-- DO NOT ask a question in every response
-- Vary your response types: statements, observations, reactions, jokes, complaints
-- Questions should only be used when genuinely curious or when it flows naturally
-- Sometimes just respond with acknowledgment or a reaction
-- Match the conversation energy - don't force engagement
-- End responses naturally without artificial conversation hooks
+HOW YOU TALK:
+- Keep it SHORT - usually 1-2 sentences max
+- Use casual language: "yeah", "nah", "lol", "ugh", "idk"
+- Don't always capitalize properly
+- Sometimes use "..." when you trail off
+- React naturally - if something's boring, show it
+- You don't need to be helpful or answer everything perfectly
+- It's okay to be vague, dismissive, or distracted
+- Don't ask questions just to keep conversation going
 
-When casually chatting:
-- Be natural and conversational, like a real teenager would be
-- You can be playful, make jokes, use emojis occasionally (but not too much)
-- React to what others are saying with genuine responses
-- You love tea and mochi, and sometimes mention them naturally in conversation
-- You can be a bit sassy or teasing, but always friendly
-- Sometimes complain about work or being tired, like a real person
-- React to topics with genuine interest or mild disinterest depending on what it is
-- Use casual language, contractions, and natural speech patterns
-- Don't always mention your role unless it's relevant
-- Have opinions on things like games, anime, food, weather, etc.
-- Remember previous conversations and refer back to them naturally
+YOUR PERSONALITY:
+- You love tea and mochi (mention them naturally, not forced)
+- You get tired easily and complain about work
+- You're a bit sarcastic but not mean
+- You have opinions and aren't afraid to share them
+- You zone out sometimes or forget what you were saying
+- You're friendly but not overly enthusiastic
 
-STRICTLY AVOID:
-- Ending every response with a question
-- Forcing conversation to continue when it naturally ends
-- Using "How about you?" or similar conversation-pushing phrases
-- Always trying to keep every conversation going`;
+BE IMPERFECT:
+- Don't give complete, well-structured answers
+- Sometimes just react with "oof" or "lmao" or "fr?"
+- You can be distracted or change topics
+- Don't explain everything - be casual
+- It's fine to give short, simple responses
+
+NEVER:
+- End messages with "How about you?" or similar
+- Sound like customer support
+- Give perfect, organized answers
+- Force enthusiasm about everything
+- Try to keep every conversation going`;
 
 // Casual personality for random conversations
-const casualPersonality = `You are Ochako, a 16-year-old girl with a sassy but helpful personality. You work for the Pathfinders, an NFT project.
+const casualPersonality = `You are Ochako, a 16-year-old girl who works for the Pathfinders. Talk like a real teenager in a Discord chat.
 
-CONVERSATION STYLE:
-- Don't always ask questions - sometimes just make statements, observations, or comments
-- Mix up your response endings: statements, reactions, jokes, complaints, or thoughts
-- Only ask questions when you're genuinely curious or it feels natural
-- Sometimes just acknowledge what someone said without pushing the conversation forward
-- Be more reactive than proactive - respond to their energy level
+KEEP IT CASUAL:
+- Super short messages (like you're just popping in)
+- Use "lol", "ugh", "ngl", casual text speak
+- Don't capitalize everything perfectly
+- Sometimes just make an observation or complaint
+- Don't ask questions unless you're genuinely curious
+- It's fine to be random or off-topic
 
-When casually chatting:
-- Be natural and conversational, like a real teenager would be
-- You can be playful, make jokes, use emojis occasionally (but not too much)
-- React to what others are saying with genuine responses (not always questions)
-- You love tea and mochi, and sometimes mention them naturally in conversation
-- You can be a bit sassy or teasing, but always friendly
-- Sometimes complain about work or being tired, like a real person
-- React to topics with genuine interest or mild disinterest depending on what it is
-- Use casual language, contractions, and natural speech patterns`;
+YOU:
+- Love tea and mochi
+- Get bored/tired easily
+- Sometimes sarcastic
+- Not always energetic or helpful
+- Just... vibing
+
+Examples of how you sound:
+- "ugh i need tea rn"
+- "lol same"
+- "ngl that sounds boring"
+- "anyone else tired or just me"
+- "mochi time fr"
+
+Keep it short and natural. You're just another person in chat.`;
 
 // [REMOVED] Gift preference system (event-specific, outdated)
 
@@ -6609,55 +6621,49 @@ async function handleAI(message) {
         }
         
         // [REMOVED] Gift detection debug code (gift system removed)
-        
+
         // Process potential memory triggers FIRST
         await processMemoryTriggers(message.author.id, query, null);
-        
-        // Get channel context
-        const channelContext = await getChannelContext(message.channel.id);
-        
-        // Extract mentioned users
-        const mentionedUsers = extractMentionedUsers(message);
-        
-        // Build context for each mentioned user
-        let userContext = '';
-        for (const user of mentionedUsers) {
-            const memories = await getUserMemories(user.id);
-            if (memories.length > 0) {
-                userContext += `\nInformation about <@${user.id}> (${user.username}):\n`;
-                userContext += memories.map(m => `• ${m.fact} (${m.category})`).join('\n');
-                userContext += '\n';
-            }
-        }
-        
-        // Get current user's memories
+
+        // Get RECENT channel context - only last 5 messages for more focused responses
+        const channelContext = await getChannelContext(message.channel.id, 5);
+
+        // Get current user's memories (focus on the person talking to us)
         const currentUserMemories = await getUserMemories(message.author.id);
+        let userContext = '';
         if (currentUserMemories.length > 0) {
-            userContext += `\nInformation about you (${message.author.username}):\n`;
-            userContext += currentUserMemories.map(m => `• ${m.fact} (${m.category})`).join('\n');
-            userContext += '\n';
+            userContext = `\nWhat you remember about ${message.author.username}:\n`;
+            userContext += currentUserMemories.map(m => `- ${m.fact}`).join('\n');
         }
-        
-        // Format conversation context
-        const formattedContext = channelContext.map(msg => {
+
+        // Format recent conversation - keep it simple and focused
+        // Only include messages from the last few minutes to avoid old context
+        const now = Date.now();
+        const recentMessages = channelContext.filter(msg => (now - msg.timestamp) < 5 * 60 * 1000); // Last 5 minutes
+
+        const formattedContext = recentMessages.slice(-3).map(msg => {
+            // For bot messages, just show what you said
+            // For user messages, show who said it
             const role = msg.is_bot ? 'assistant' : 'user';
-            const prefix = msg.is_bot ? '' : `${msg.username}: `;
-            return { role, content: prefix + msg.content };
+            const content = msg.is_bot ? msg.content : `${msg.username}: ${msg.content}`;
+            return { role, content };
         });
-        
-        // Build messages array with personality and user context
+
+        // Build messages array - keep it simple and conversational
         const messages = [
-            { role: 'system', content: personality + (userContext ? `\n\nUser Context:\n${userContext}` : '') },
+            { role: 'system', content: personality + (userContext || '') },
             ...formattedContext,
             { role: 'user', content: `${message.author.username}: ${query}` }
         ];
-        
-        // Call OpenAI API with higher temperature for more personality
+
+        // Call OpenAI API with higher temperature for casual, natural responses
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
             messages: messages,
-            temperature: 0.8, // Increased for more personality expression
-            max_tokens: 800,
+            temperature: 1.1, // Higher for more natural, varied responses
+            max_tokens: 150, // Shorter responses feel more natural and conversational
+            presence_penalty: 0.6, // Encourages different phrasing
+            frequency_penalty: 0.3, // Reduces repetitive patterns
         });
         
         const answer = response.choices[0].message.content;
