@@ -1240,31 +1240,52 @@ function getTemporalContext() {
 async function enhancedProcessMemoryTriggers(userId, userMessage, username) {
     const lowerMessage = userMessage.toLowerCase();
 
-    // Birthday detection patterns
+    // Enhanced birthday detection patterns
     const birthdayPatterns = [
-        /my birthday is (?:on )?(\w+ \d+)/i,
-        /i was born (?:on )?(\w+ \d+)/i,
-        /birthday.*?(\w+ \d+)/i,
-        /born (?:in|on) (\w+ \d+)/i
+        /my birthday is (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
+        /birthday is (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
+        /i was born (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
+        /born (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
+        /bday is (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
+        /birthday.*?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
+        /(\d+)\/(\d+)/,  // Matches 12/25 or 5/15 format
+        /(\w+)\s+(\d+)(?:st|nd|rd|th)?/  // Fallback for "May 15" or "May 15th"
     ];
 
     for (const pattern of birthdayPatterns) {
         const match = userMessage.match(pattern);
         if (match) {
             try {
-                const dateStr = match[1];
-                const parsedDate = new Date(dateStr + ', 2000'); // Use dummy year for parsing
+                let dateStr;
+                let parsedDate;
+
+                // Handle MM/DD format
+                if (match[0].includes('/')) {
+                    const month = parseInt(match[1]);
+                    const day = parseInt(match[2]);
+                    parsedDate = new Date(2000, month - 1, day);
+                    dateStr = parsedDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+                } else {
+                    // Handle text format (e.g., "May 15" or "May 15th")
+                    dateStr = match[1].replace(/(\d+)(st|nd|rd|th)/, '$1'); // Remove ordinal suffixes
+                    parsedDate = new Date(dateStr + ', 2000'); // Use dummy year for parsing
+                }
 
                 if (!isNaN(parsedDate.getTime())) {
                     const birthdayTimestamp = parsedDate.getTime();
+
+                    console.log(`🎂 Detected birthday for ${username}: ${dateStr}`);
+                    console.log(`   Storing to special_dates, user_profiles, and user_memory...`);
+
                     await storeSpecialDate(userId, 'birthday', birthdayTimestamp, `${username}'s birthday`, true);
                     await updateUserProfile(userId, username, { birthday: birthdayTimestamp });
                     await storeUserFact(userId, `Birthday is on ${dateStr}`, 'personal', 1.0, 'detected');
-                    console.log(`🎂 Detected birthday for ${username}: ${dateStr}`);
+
+                    console.log(`✅ Birthday stored successfully for ${username}!`);
                     return true;
                 }
             } catch (err) {
-                console.error('Error parsing birthday:', err);
+                console.error('❌ Error parsing birthday:', err);
             }
         }
     }
@@ -6805,6 +6826,12 @@ client.on('messageCreate', async message => {
         return;
     }
 
+    // Handle birthday command
+    if (message.content.startsWith('!birthday ')) {
+        await handleBirthdayCommand(message);
+        return;
+    }
+
     // Handle random chat admin commands
     if (message.content.startsWith('!randomchat ')) {
         // Only admins can use these commands
@@ -7838,24 +7865,76 @@ async function handleAI(message) {
     try {
         // Extract the fact from the message
         const fact = message.content.substring('!remember '.length);
-        
+
         if (fact.length < 3) {
             await message.reply("Please provide more information to remember.");
             return;
         }
-        
+
         console.log(`📝 Manual memory storage: ${message.author.id} - "${fact}"`);
-        
+
         // Store directly to the database
         await storeUserFact(message.author.id, fact, 'command', 1.0, 'direct');
         await message.reply("I'll remember that about you!");
-        
+
     } catch (error) {
         console.error('❌ Exception in storeUserCommand:', error);
         await message.reply("Something went wrong when trying to store that memory.");
     }
  }
- 
+
+ // Handle birthday command for manual setting
+ async function handleBirthdayCommand(message) {
+    try {
+        const dateStr = message.content.substring('!birthday '.length).trim();
+
+        if (dateStr.length < 3) {
+            await message.reply("Please provide your birthday! Examples:\n`!birthday May 15`\n`!birthday 5/15`\n`!birthday December 25th`");
+            return;
+        }
+
+        // Try to parse the date
+        let parsedDate;
+        let formattedDate;
+
+        // Handle MM/DD format
+        if (dateStr.includes('/')) {
+            const parts = dateStr.split('/');
+            if (parts.length === 2) {
+                const month = parseInt(parts[0]);
+                const day = parseInt(parts[1]);
+                parsedDate = new Date(2000, month - 1, day);
+                formattedDate = parsedDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric' });
+            }
+        } else {
+            // Handle text format
+            const cleanedDate = dateStr.replace(/(\d+)(st|nd|rd|th)/, '$1');
+            parsedDate = new Date(cleanedDate + ', 2000');
+            formattedDate = dateStr;
+        }
+
+        if (!parsedDate || isNaN(parsedDate.getTime())) {
+            await message.reply("I couldn't understand that date format. Try:\n`!birthday May 15` or `!birthday 5/15`");
+            return;
+        }
+
+        const birthdayTimestamp = parsedDate.getTime();
+
+        console.log(`🎂 Manual birthday set for ${message.author.username}: ${formattedDate}`);
+
+        await storeSpecialDate(message.author.id, 'birthday', birthdayTimestamp, `${message.author.username}'s birthday`, true);
+        await updateUserProfile(message.author.id, message.author.username, { birthday: birthdayTimestamp });
+        await storeUserFact(message.author.id, `Birthday is on ${formattedDate}`, 'personal', 1.0, 'manual');
+
+        await message.reply(`Got it! I'll remember your birthday is on ${formattedDate} 🎂`);
+        console.log(`✅ Birthday stored successfully for ${message.author.username}!`);
+
+    } catch (error) {
+        console.error('❌ Exception in handleBirthdayCommand:', error);
+        await message.reply("Something went wrong. Try: `!birthday May 15` or `!birthday 5/15`");
+    }
+ }
+
  // Reinforce related memories based on current message
  async function reinforceRelatedMemories(userId, message) {
     const memories = await getUserMemories(userId);
