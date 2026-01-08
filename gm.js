@@ -5683,11 +5683,11 @@ client.on(Events.InteractionCreate, async interaction => {
                         // Show all available items from all shops
                         const allItems = await new Promise((resolve, reject) => {
                             db.all(`
-                                SELECT name, '🍡 Mochi' as shop_label, 'mochi' as shop_type FROM items WHERE active = 1
+                                SELECT name, '🍡 Mochi' as shop_label, 'mochi' as shop_type FROM items
                                 UNION
-                                SELECT name, '🌺 Waterlily' as shop_label, 'waterlily' as shop_type FROM waterlily_items WHERE active = 1
+                                SELECT name, '🌺 Waterlily' as shop_label, 'waterlily' as shop_type FROM waterlily_items
                                 UNION
-                                SELECT name, '⚔️ Equipment' as shop_label, 'equipment' as shop_type FROM equipment_items WHERE active = 1
+                                SELECT name, '⚔️ Equipment' as shop_label, 'equipment' as shop_type FROM equipment_items
                                 ORDER BY name
                             `, [], (err, rows) => {
                                 if (err) reject(err);
