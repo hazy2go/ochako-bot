@@ -319,10 +319,70 @@ function initializeAIDatabase() {
                 }
             });
 
+            // User profiles - enhanced personal data
+            aiDb.run(`CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id TEXT PRIMARY KEY,
+                username TEXT,
+                birthday INTEGER,
+                birthday_year INTEGER,
+                first_interaction INTEGER,
+                last_interaction INTEGER,
+                total_messages INTEGER DEFAULT 0,
+                relationship_strength REAL DEFAULT 0.0,
+                favorite_topics TEXT,
+                emotional_context TEXT,
+                timezone TEXT,
+                updated_at INTEGER
+            )`, (err) => {
+                if (err) console.error('❌ Error creating user_profiles table:', err);
+            });
+
+            // Interaction timeline - when and how often users interact
+            aiDb.run(`CREATE TABLE IF NOT EXISTS interaction_timeline (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                channel_id TEXT,
+                interaction_type TEXT,
+                emotional_tone TEXT,
+                duration INTEGER
+            )`, (err) => {
+                if (err) console.error('❌ Error creating interaction_timeline table:', err);
+            });
+
+            // Special dates and events to remember
+            aiDb.run(`CREATE TABLE IF NOT EXISTS special_dates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                date_type TEXT NOT NULL,
+                date_timestamp INTEGER NOT NULL,
+                description TEXT,
+                recurring INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL
+            )`, (err) => {
+                if (err) console.error('❌ Error creating special_dates table:', err);
+            });
+
+            // Memory associations - connect memories together
+            aiDb.run(`CREATE TABLE IF NOT EXISTS memory_associations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id_1 INTEGER NOT NULL,
+                memory_id_2 INTEGER NOT NULL,
+                association_type TEXT,
+                strength REAL DEFAULT 0.5,
+                FOREIGN KEY (memory_id_1) REFERENCES user_memory(id),
+                FOREIGN KEY (memory_id_2) REFERENCES user_memory(id)
+            )`, (err) => {
+                if (err) console.error('❌ Error creating memory_associations table:', err);
+            });
+
             // Performance indices for AI queries
             aiDb.run('CREATE INDEX IF NOT EXISTS idx_user_memory_user ON user_memory(user_id)');
-            aiDb.run('CREATE INDEX IF NOT EXISTS idx_context_channel ON conversation_context(channel_id)', (err) => {
-                if (err) console.error('❌ Error creating context index:', err);
+            aiDb.run('CREATE INDEX IF NOT EXISTS idx_context_channel ON conversation_context(channel_id)');
+            aiDb.run('CREATE INDEX IF NOT EXISTS idx_profiles_user ON user_profiles(user_id)');
+            aiDb.run('CREATE INDEX IF NOT EXISTS idx_timeline_user ON interaction_timeline(user_id)');
+            aiDb.run('CREATE INDEX IF NOT EXISTS idx_special_dates_user ON special_dates(user_id)', (err) => {
+                if (err) console.error('❌ Error creating indices:', err);
                 else console.log('✅ AI database tables initialized successfully');
                 resolve();
             });
@@ -888,6 +948,233 @@ async function getMemoryAcknowledgment(fact) {
     ];
     
     return acknowledgments[Math.floor(Math.random() * acknowledgments.length)];
+}
+
+// ============================================================================
+// ENHANCED MEMORY & AWARENESS FUNCTIONS
+// ============================================================================
+
+// Update or create user profile
+async function updateUserProfile(userId, username, updates = {}) {
+    return new Promise((resolve, reject) => {
+        const now = Date.now();
+
+        aiDb.get('SELECT * FROM user_profiles WHERE user_id = ?', [userId], (err, profile) => {
+            if (err) return reject(err);
+
+            if (!profile) {
+                // Create new profile
+                aiDb.run(`
+                    INSERT INTO user_profiles
+                    (user_id, username, first_interaction, last_interaction, total_messages, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                `, [userId, username, now, now, now], (err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            } else {
+                // Update existing profile
+                const fields = [];
+                const values = [];
+
+                if (updates.birthday) {
+                    fields.push('birthday = ?');
+                    values.push(updates.birthday);
+                }
+                if (updates.birthday_year) {
+                    fields.push('birthday_year = ?');
+                    values.push(updates.birthday_year);
+                }
+                if (updates.timezone) {
+                    fields.push('timezone = ?');
+                    values.push(updates.timezone);
+                }
+
+                // Always update these
+                fields.push('username = ?', 'last_interaction = ?', 'total_messages = total_messages + 1', 'updated_at = ?');
+                values.push(username, now, now);
+
+                // Calculate relationship strength (more interactions = stronger)
+                const daysSinceFirst = (now - profile.first_interaction) / (1000 * 60 * 60 * 24);
+                const messagesPerDay = (profile.total_messages + 1) / Math.max(daysSinceFirst, 1);
+                const relationshipStrength = Math.min(messagesPerDay * 0.1, 1.0);
+
+                fields.push('relationship_strength = ?');
+                values.push(relationshipStrength);
+
+                values.push(userId);
+
+                aiDb.run(`
+                    UPDATE user_profiles
+                    SET ${fields.join(', ')}
+                    WHERE user_id = ?
+                `, values, (err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            }
+        });
+    });
+}
+
+// Track an interaction in timeline
+async function trackInteraction(userId, channelId, interactionType = 'message', emotionalTone = null) {
+    return new Promise((resolve, reject) => {
+        aiDb.run(`
+            INSERT INTO interaction_timeline
+            (user_id, timestamp, channel_id, interaction_type, emotional_tone)
+            VALUES (?, ?, ?, ?, ?)
+        `, [userId, Date.now(), channelId, interactionType, emotionalTone], (err) => {
+            if (err) reject(err);
+            else resolve();
+        });
+    });
+}
+
+// Store a special date (birthday, anniversary, etc.)
+async function storeSpecialDate(userId, dateType, timestamp, description = null, recurring = true) {
+    return new Promise((resolve, reject) => {
+        aiDb.run(`
+            INSERT INTO special_dates
+            (user_id, date_type, date_timestamp, description, recurring, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `, [userId, dateType, timestamp, description, recurring ? 1 : 0, Date.now()], (err) => {
+            if (err) reject(err);
+            else {
+                console.log(`🎂 Stored ${dateType} for user ${userId}`);
+                resolve();
+            }
+        });
+    });
+}
+
+// Get user's profile with memories
+async function getUserProfile(userId) {
+    return new Promise((resolve, reject) => {
+        aiDb.get('SELECT * FROM user_profiles WHERE user_id = ?', [userId], (err, profile) => {
+            if (err) return reject(err);
+            resolve(profile);
+        });
+    });
+}
+
+// Check for upcoming birthdays or special dates
+async function getUpcomingEvents(userId, daysAhead = 7) {
+    return new Promise((resolve, reject) => {
+        const now = new Date();
+        const futureDate = new Date(now.getTime() + (daysAhead * 24 * 60 * 60 * 1000));
+
+        aiDb.all(`
+            SELECT * FROM special_dates
+            WHERE user_id = ?
+            AND date_timestamp BETWEEN ? AND ?
+            ORDER BY date_timestamp ASC
+        `, [userId, now.getTime(), futureDate.getTime()], (err, events) => {
+            if (err) reject(err);
+            else resolve(events || []);
+        });
+    });
+}
+
+// Get time-based context for personality
+function getTemporalContext() {
+    const now = new Date();
+    const hour = now.getHours();
+    const day = now.getDay();
+    const date = now.getDate();
+    const month = now.getMonth();
+    const dayName = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][day];
+    const monthName = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'][month];
+
+    let timeOfDay;
+    if (hour >= 5 && hour < 12) timeOfDay = 'morning';
+    else if (hour >= 12 && hour < 17) timeOfDay = 'afternoon';
+    else if (hour >= 17 && hour < 22) timeOfDay = 'evening';
+    else timeOfDay = 'night';
+
+    let season;
+    if (month >= 2 && month <= 4) season = 'spring';
+    else if (month >= 5 && month <= 7) season = 'summer';
+    else if (month >= 8 && month <= 10) season = 'fall';
+    else season = 'winter';
+
+    return {
+        hour,
+        timeOfDay,
+        dayName,
+        monthName,
+        date,
+        season,
+        formatted: `${dayName}, ${monthName} ${date}`,
+        timeString: now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true })
+    };
+}
+
+// Enhanced memory triggers - now including birthdays
+async function enhancedProcessMemoryTriggers(userId, userMessage, username) {
+    const lowerMessage = userMessage.toLowerCase();
+
+    // Birthday detection patterns
+    const birthdayPatterns = [
+        /my birthday is (?:on )?(\w+ \d+)/i,
+        /i was born (?:on )?(\w+ \d+)/i,
+        /birthday.*?(\w+ \d+)/i,
+        /born (?:in|on) (\w+ \d+)/i
+    ];
+
+    for (const pattern of birthdayPatterns) {
+        const match = userMessage.match(pattern);
+        if (match) {
+            try {
+                const dateStr = match[1];
+                const parsedDate = new Date(dateStr + ', 2000'); // Use dummy year for parsing
+
+                if (!isNaN(parsedDate.getTime())) {
+                    const birthdayTimestamp = parsedDate.getTime();
+                    await storeSpecialDate(userId, 'birthday', birthdayTimestamp, `${username}'s birthday`, true);
+                    await updateUserProfile(userId, username, { birthday: birthdayTimestamp });
+                    await storeUserFact(userId, `Birthday is on ${dateStr}`, 'personal', 1.0, 'detected');
+                    console.log(`🎂 Detected birthday for ${username}: ${dateStr}`);
+                    return true;
+                }
+            } catch (err) {
+                console.error('Error parsing birthday:', err);
+            }
+        }
+    }
+
+    return false;
+}
+
+// Get relationship context for a user
+async function getRelationshipContext(userId) {
+    const profile = await getUserProfile(userId);
+    if (!profile) return null;
+
+    const now = Date.now();
+    const daysSinceFirst = (now - profile.first_interaction) / (1000 * 60 * 60 * 24);
+    const daysSinceLast = (now - profile.last_interaction) / (1000 * 60 * 60 * 24);
+
+    let relationshipLevel;
+    if (profile.relationship_strength > 0.7) relationshipLevel = 'close friend';
+    else if (profile.relationship_strength > 0.4) relationshipLevel = 'friend';
+    else if (profile.relationship_strength > 0.1) relationshipLevel = 'acquaintance';
+    else relationshipLevel = 'new person';
+
+    let timeSinceLastChat;
+    if (daysSinceLast < 0.04) timeSinceLastChat = 'just now';
+    else if (daysSinceLast < 1) timeSinceLastChat = 'today';
+    else if (daysSinceLast < 7) timeSinceLastChat = `${Math.floor(daysSinceLast)} day(s) ago`;
+    else if (daysSinceLast < 30) timeSinceLastChat = `${Math.floor(daysSinceLast / 7)} week(s) ago`;
+    else timeSinceLastChat = 'a long time ago';
+
+    return {
+        relationshipLevel,
+        timeSinceLastChat,
+        totalMessages: profile.total_messages,
+        daysSinceFirst: Math.floor(daysSinceFirst),
+        shouldGreet: daysSinceLast > 1 // Haven't talked in over a day
+    };
 }
 
 // ============================================================================
@@ -6617,8 +6904,19 @@ async function handleAI(message) {
         
         // [REMOVED] Gift detection debug code (gift system removed)
 
-        // Process potential memory triggers FIRST
+        // Update user profile and track interaction
+        await updateUserProfile(message.author.id, message.author.username);
+        await trackInteraction(message.author.id, message.channel.id, 'ai_conversation');
+
+        // Process memory triggers (including birthday detection)
         await processMemoryTriggers(message.author.id, query, null);
+        await enhancedProcessMemoryTriggers(message.author.id, query, message.author.username);
+
+        // Get temporal context (time, date awareness)
+        const timeContext = getTemporalContext();
+
+        // Get relationship context
+        const relationshipContext = await getRelationshipContext(message.author.id);
 
         // Get RECENT channel context - only last 5 messages for more focused responses
         const channelContext = await getChannelContext(message.channel.id, 5);
@@ -6630,6 +6928,25 @@ async function handleAI(message) {
             userContext = `\nWhat you remember about ${message.author.username}:\n`;
             userContext += currentUserMemories.map(m => `- ${m.fact}`).join('\n');
         }
+
+        // Add relationship context if available
+        if (relationshipContext) {
+            userContext += `\n\nRelationship context:`;
+            userContext += `\n- You've known them for ${relationshipContext.daysSinceFirst} days`;
+            userContext += `\n- You last talked ${relationshipContext.timeSinceLastChat}`;
+            userContext += `\n- They've messaged you ${relationshipContext.totalMessages} times`;
+            if (relationshipContext.shouldGreet) {
+                userContext += `\n- NOTE: You haven't talked to them in a while, acknowledge this naturally!`;
+            }
+        }
+
+        // Add temporal awareness to system prompt
+        let enhancedPersonality = personality;
+        enhancedPersonality += `\n\nCURRENT CONTEXT:\n`;
+        enhancedPersonality += `- Today is ${timeContext.formatted}\n`;
+        enhancedPersonality += `- It's ${timeContext.timeOfDay} (${timeContext.timeString})\n`;
+        enhancedPersonality += `- Current season: ${timeContext.season}\n`;
+        enhancedPersonality += `- Use this information naturally (mention time/date when relevant)`;
 
         // Format recent conversation - keep it simple and focused
         // Only include messages from the last few minutes to avoid old context
@@ -6646,7 +6963,7 @@ async function handleAI(message) {
 
         // Build messages array - keep it simple and conversational
         const messages = [
-            { role: 'system', content: personality + (userContext || '') },
+            { role: 'system', content: enhancedPersonality + (userContext || '') },
             ...formattedContext,
             { role: 'user', content: `${message.author.username}: ${query}` }
         ];
