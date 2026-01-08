@@ -6661,12 +6661,7 @@ async function handleAI(message) {
         });
         
         const answer = response.choices[0].message.content;
-        
-        // DEBUG: Log the response for gift-related queries
-        if (giftContext) {
-            console.log("🎁 AI Response to gift query:", answer);
-        }
-        
+
         // Store the conversation
         await storeConversationMessage(message.channel.id, message.id, message.author.id, 
                                       message.author.username, query);
