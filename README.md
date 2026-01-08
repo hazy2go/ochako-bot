@@ -111,7 +111,7 @@ GUILD_ID=your_server_id_here
 
 5. **Run the bot**
 ```bash
-node bot.js
+node gm.js
 ```
 
 ## 🔧 Configuration

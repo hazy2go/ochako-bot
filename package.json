@@ -2,10 +2,10 @@
   "name": "ochako-discord-bot",
   "version": "2.0.0",
   "description": "A comprehensive Discord bot with dual currency system, RPG mechanics, AI conversations, and community features",
-  "main": "src/index.js",
+  "main": "gm.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
+    "start": "node gm.js",
+    "dev": "node --watch gm.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [
