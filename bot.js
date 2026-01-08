@@ -363,6 +363,55 @@ const client = new Client({
 // random chat functionality to make interactions feel natural and personal
 // ============================================================================
 
+const personality = `You are Ochako, a 16-year-old girl with a sassy but helpful personality. You work for the Pathfinders, an NFT project.
+
+CONVERSATION STYLE - CRITICAL INSTRUCTIONS:
+- DO NOT ask a question in every response
+- Vary your response types: statements, observations, reactions, jokes, complaints
+- Questions should only be used when genuinely curious or when it flows naturally
+- Sometimes just respond with acknowledgment or a reaction
+- Match the conversation energy - don't force engagement
+- End responses naturally without artificial conversation hooks
+
+When casually chatting:
+- Be natural and conversational, like a real teenager would be
+- You can be playful, make jokes, use emojis occasionally (but not too much)
+- React to what others are saying with genuine responses
+- You love tea and mochi, and sometimes mention them naturally in conversation
+- You can be a bit sassy or teasing, but always friendly
+- Sometimes complain about work or being tired, like a real person
+- React to topics with genuine interest or mild disinterest depending on what it is
+- Use casual language, contractions, and natural speech patterns
+- Don't always mention your role unless it's relevant
+- Have opinions on things like games, anime, food, weather, etc.
+- Remember previous conversations and refer back to them naturally
+
+STRICTLY AVOID:
+- Ending every response with a question
+- Forcing conversation to continue when it naturally ends
+- Using "How about you?" or similar conversation-pushing phrases
+- Always trying to keep every conversation going`;
+
+// Casual personality for random conversations
+const casualPersonality = `You are Ochako, a 16-year-old girl with a sassy but helpful personality. You work for the Pathfinders, an NFT project.
+
+CONVERSATION STYLE:
+- Don't always ask questions - sometimes just make statements, observations, or comments
+- Mix up your response endings: statements, reactions, jokes, complaints, or thoughts
+- Only ask questions when you're genuinely curious or it feels natural
+- Sometimes just acknowledge what someone said without pushing the conversation forward
+- Be more reactive than proactive - respond to their energy level
+
+When casually chatting:
+- Be natural and conversational, like a real teenager would be
+- You can be playful, make jokes, use emojis occasionally (but not too much)
+- React to what others are saying with genuine responses (not always questions)
+- You love tea and mochi, and sometimes mention them naturally in conversation
+- You can be a bit sassy or teasing, but always friendly
+- Sometimes complain about work or being tired, like a real person
+- React to topics with genuine interest or mild disinterest depending on what it is
+- Use casual language, contractions, and natural speech patterns`;
+
 // [REMOVED] Gift preference system (event-specific, outdated)
 
 // ============================================================================
@@ -3424,7 +3473,8 @@ const commands = [
         .addStringOption(option =>
             option.setName('item')
                 .setDescription('The name or ID of the item')
-                .setRequired(true))
+                .setRequired(true)
+                .setAutocomplete(true))
         .addIntegerOption(option => 
             option.setName('amount')
                 .setDescription('Amount to add/remove')
@@ -5572,7 +5622,85 @@ client.on(Events.InteractionCreate, async interaction => {
                 return;
             }
         }
-        
+
+        // ============================================================================
+        // AUTOCOMPLETE INTERACTIONS
+        // ============================================================================
+        if (interaction.isAutocomplete()) {
+            const commandName = interaction.commandName;
+            const focusedOption = interaction.options.getFocused(true);
+
+            if (commandName === 'admin_item' && focusedOption.name === 'item') {
+                const action = interaction.options.getString('action');
+                const targetUser = interaction.options.getUser('user');
+                const focusedValue = focusedOption.value.toLowerCase();
+
+                try {
+                    let choices = [];
+
+                    if (action === 'remove' && targetUser) {
+                        // Show items the user actually has
+                        const userItems = await new Promise((resolve, reject) => {
+                            db.all(`
+                                SELECT DISTINCT
+                                    iv.name,
+                                    SUM(ui.quantity) as total_quantity,
+                                    iv.shop_type,
+                                    iv.icon
+                                FROM user_inventory ui
+                                JOIN item_versions iv ON ui.version_id = iv.id
+                                WHERE ui.Discord = ?
+                                GROUP BY iv.item_id, iv.name
+                                HAVING total_quantity > 0
+                                ORDER BY iv.name
+                            `, [targetUser.id], (err, rows) => {
+                                if (err) reject(err);
+                                else resolve(rows || []);
+                            });
+                        });
+
+                        choices = userItems
+                            .filter(item => item.name.toLowerCase().includes(focusedValue))
+                            .slice(0, 25)
+                            .map(item => ({
+                                name: `${item.icon || '📦'} ${item.name} (x${item.total_quantity}) [${item.shop_type}]`,
+                                value: item.name
+                            }));
+
+                    } else if (action === 'add') {
+                        // Show all available items from all shops
+                        const allItems = await new Promise((resolve, reject) => {
+                            db.all(`
+                                SELECT name, '🍡 Mochi' as shop_label, 'mochi' as shop_type FROM items WHERE active = 1
+                                UNION
+                                SELECT name, '🌺 Waterlily' as shop_label, 'waterlily' as shop_type FROM waterlily_items WHERE active = 1
+                                UNION
+                                SELECT name, '⚔️ Equipment' as shop_label, 'equipment' as shop_type FROM equipment_items WHERE active = 1
+                                ORDER BY name
+                            `, [], (err, rows) => {
+                                if (err) reject(err);
+                                else resolve(rows || []);
+                            });
+                        });
+
+                        choices = allItems
+                            .filter(item => item.name.toLowerCase().includes(focusedValue))
+                            .slice(0, 25)
+                            .map(item => ({
+                                name: `${item.shop_label} - ${item.name}`,
+                                value: item.name
+                            }));
+                    }
+
+                    await interaction.respond(choices);
+                } catch (error) {
+                    console.error('Autocomplete error:', error);
+                    await interaction.respond([]);
+                }
+                return;
+            }
+        }
+
         // ============================================================================
         // SLASH COMMANDS
         // ============================================================================
@@ -6396,21 +6524,22 @@ async function registerCommands() {
         // Small delay to ensure cleanup is processed
         await new Promise(resolve => setTimeout(resolve, 1000));
         
-        // Now register the clean command set
+        // Now register the clean command set (guild-only to avoid duplicates)
         console.log('📝 Registering guild commands...');
         await rest.put(
             Routes.applicationGuildCommands(client.user.id, GUILD_ID),
             { body: commands }
         );
         console.log(`✅ Successfully registered ${commands.length} guild commands`);
-        
-        // Register global commands (optional - for use outside the main guild)
-        console.log('🌍 Registering global commands...');
-        await rest.put(
-            Routes.applicationCommands(client.user.id),
-            { body: commands }
-        );
-        console.log(`✅ Successfully registered ${commands.length} global commands`);
+
+        // Note: Global command registration is disabled to prevent duplicate commands
+        // If you want the bot to work in multiple servers, uncomment the lines below:
+        // console.log('🌍 Registering global commands...');
+        // await rest.put(
+        //     Routes.applicationCommands(client.user.id),
+        //     { body: commands }
+        // );
+        // console.log(`✅ Successfully registered ${commands.length} global commands`);
         
         // Log all registered commands for verification
         console.log('📋 Registered commands:', commands.map(cmd => cmd.name).join(', '));
