@@ -1,0 +1,44 @@
+# Environment variables (NEVER commit these!)
+.env
+
+# Database files
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Node modules
+node_modules/
+package-lock.json
+yarn.lock
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Backup files
+*.bak
+*.backup
+*_backup*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Debug files
+debug/
