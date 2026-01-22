@@ -4804,7 +4804,7 @@ const commands = [
                 .setRequired(true)),
 
     new SlashCommandBuilder()
-        .setName('archive')
+        .setName('layout')
         .setDescription('Archive categories/channels or create server snapshot (Admin only)')
         .addSubcommand(subcommand =>
             subcommand
@@ -4878,7 +4878,7 @@ function verifyCommands() {
         'poll', 'raffle',
         'admin_items', 'admin_inventory', 'admin_update', 'admin_searchitem',
         'admin_item', 'admin_give', 'admin_stats', 'admin_leaderboard', 'setupshops', 'rolesnapshot', 'massrole',
-        'archive', 'restore', 'snapshots'
+        'layout', 'restore', 'snapshots'
     ];
 
     console.log('=== COMMAND VERIFICATION ===');
@@ -6405,7 +6405,7 @@ function serializePermissions(channel) {
 }
 
 // Handle archive command
-async function handleArchiveCommand(interaction) {
+async function handleLayoutCommand(interaction) {
     try {
         if (!isAdmin(interaction.member)) {
             await interaction.reply({
@@ -7210,7 +7210,7 @@ const commandHandlers = {
     'setupshops': setupShops,
     'rolesnapshot': handleRoleSnapshot,
     'massrole': handleMassRole,
-    'archive': handleArchiveCommand,
+    'layout': handleLayoutCommand,
     'restore': handleRestoreCommand,
     'snapshots': handleSnapshotsCommand
 };
@@ -8041,7 +8041,7 @@ if (interaction.isChatInputCommand()) {
         case 'setupshops':
         case 'rolesnapshot':
         case 'massrole':
-        case 'archive':
+        case 'layout':
         case 'restore':
         case 'snapshots':
             if (!isAdmin(interaction.member)) {
@@ -8087,8 +8087,8 @@ if (interaction.isChatInputCommand()) {
                 case 'massrole':
                     await handleMassRole(interaction);
                     break;
-                case 'archive':
-                    await handleArchiveCommand(interaction);
+                case 'layout':
+                    await handleLayoutCommand(interaction);
                     break;
                 case 'restore':
                     await handleRestoreCommand(interaction);
@@ -8586,7 +8586,7 @@ async function handleAdminItemCommand(interaction) {
     }
 }
 
-async function handleArchiveCommand(interaction) {
+async function handleLayoutCommand(interaction) {
     try {
         await interaction.deferReply({ ephemeral: true });
         
