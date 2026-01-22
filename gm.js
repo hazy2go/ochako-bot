@@ -272,6 +272,51 @@ function initializeDatabase() {
         db.run('CREATE INDEX IF NOT EXISTS idx_item_versions_item ON item_versions(item_id)');
         db.run('CREATE INDEX IF NOT EXISTS idx_equipped_items_discord ON equipped_items(Discord)');
 
+        // Channel/Category archive snapshots
+        db.run(`CREATE TABLE IF NOT EXISTS channel_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_name TEXT NOT NULL,
+            snapshot_type TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            guild_id TEXT NOT NULL,
+            is_full_server INTEGER DEFAULT 0
+        )`);
+
+        // Archived categories
+        db.run(`CREATE TABLE IF NOT EXISTS archived_categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            category_id TEXT NOT NULL,
+            category_name TEXT NOT NULL,
+            position INTEGER,
+            permissions_json TEXT,
+            FOREIGN KEY (snapshot_id) REFERENCES channel_snapshots(id) ON DELETE CASCADE
+        )`);
+
+        // Archived channels
+        db.run(`CREATE TABLE IF NOT EXISTS archived_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            snapshot_id INTEGER NOT NULL,
+            archived_category_id INTEGER,
+            channel_id TEXT NOT NULL,
+            channel_name TEXT NOT NULL,
+            channel_type INTEGER NOT NULL,
+            position INTEGER,
+            topic TEXT,
+            nsfw INTEGER DEFAULT 0,
+            rate_limit INTEGER DEFAULT 0,
+            bitrate INTEGER,
+            user_limit INTEGER,
+            permissions_json TEXT,
+            parent_id TEXT,
+            FOREIGN KEY (snapshot_id) REFERENCES channel_snapshots(id) ON DELETE CASCADE,
+            FOREIGN KEY (archived_category_id) REFERENCES archived_categories(id) ON DELETE CASCADE
+        )`);
+
+        db.run('CREATE INDEX IF NOT EXISTS idx_archived_categories_snapshot ON archived_categories(snapshot_id)');
+        db.run('CREATE INDEX IF NOT EXISTS idx_archived_channels_snapshot ON archived_channels(snapshot_id)');
+
         console.log('✅ Database tables initialized successfully');
     });
 }
@@ -4756,7 +4801,68 @@ const commands = [
         .addRoleOption(option =>
             option.setName('give_role')
                 .setDescription('The role to give them')
-                .setRequired(true))
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('archive')
+        .setDescription('Archive categories/channels or create server snapshot (Admin only)')
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('categories')
+                .setDescription('Archive and delete selected categories')
+                .addStringOption(option =>
+                    option.setName('category_ids')
+                        .setDescription('Category IDs to archive (comma-separated)')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('name')
+                        .setDescription('Name for this snapshot')
+                        .setRequired(true)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('channels')
+                .setDescription('Archive and delete selected channels')
+                .addStringOption(option =>
+                    option.setName('channel_ids')
+                        .setDescription('Channel IDs to archive (comma-separated)')
+                        .setRequired(true))
+                .addStringOption(option =>
+                    option.setName('name')
+                        .setDescription('Name for this snapshot')
+                        .setRequired(true)))
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('server')
+                .setDescription('Create a full server layout snapshot (no deletion)')
+                .addStringOption(option =>
+                    option.setName('name')
+                        .setDescription('Name for this snapshot')
+                        .setRequired(true))),
+
+    new SlashCommandBuilder()
+        .setName('restore')
+        .setDescription('Restore archived categories/channels (Admin only)')
+        .addStringOption(option =>
+            option.setName('snapshot')
+                .setDescription('Name or ID of the snapshot to restore')
+                .setRequired(true)
+                .setAutocomplete(true)),
+
+    new SlashCommandBuilder()
+        .setName('snapshots')
+        .setDescription('List all saved snapshots (Admin only)')
+        .addStringOption(option =>
+            option.setName('action')
+                .setDescription('Action to perform')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'List all', value: 'list' },
+                    { name: 'Delete a snapshot', value: 'delete' }
+                ))
+        .addStringOption(option =>
+            option.setName('snapshot')
+                .setDescription('Snapshot name or ID (for delete)')
+                .setAutocomplete(true))
 ];
 
 
@@ -4769,9 +4875,10 @@ function verifyCommands() {
     const definedCommands = commands.map(cmd => cmd.name);
     const handledCommands = [
         'equipment', 'equip', 'unequip', 'inventory', 'trade', 'convert',
-        'poll', 'raffle', 'archive',
+        'poll', 'raffle',
         'admin_items', 'admin_inventory', 'admin_update', 'admin_searchitem',
-        'admin_item', 'admin_give', 'admin_stats', 'admin_leaderboard', 'setupshops', 'rolesnapshot', 'massrole'
+        'admin_item', 'admin_give', 'admin_stats', 'admin_leaderboard', 'setupshops', 'rolesnapshot', 'massrole',
+        'archive', 'restore', 'snapshots'
     ];
 
     console.log('=== COMMAND VERIFICATION ===');
@@ -6280,6 +6387,692 @@ async function handleMassRole(interaction) {
 }
 
 // ============================================================================
+// CHANNEL/CATEGORY ARCHIVE SYSTEM
+// ============================================================================
+
+// Serialize channel permissions to JSON
+function serializePermissions(channel) {
+    const permissions = [];
+    channel.permissionOverwrites.cache.forEach((overwrite, id) => {
+        permissions.push({
+            id: id,
+            type: overwrite.type,
+            allow: overwrite.allow.bitfield.toString(),
+            deny: overwrite.deny.bitfield.toString()
+        });
+    });
+    return JSON.stringify(permissions);
+}
+
+// Handle archive command
+async function handleArchiveCommand(interaction) {
+    try {
+        if (!isAdmin(interaction.member)) {
+            await interaction.reply({
+                content: '❌ You do not have permission to use this command.',
+                ephemeral: true
+            });
+            return;
+        }
+
+        await interaction.deferReply();
+
+        const subcommand = interaction.options.getSubcommand();
+        const snapshotName = interaction.options.getString('name');
+        const guild = interaction.guild;
+
+        if (subcommand === 'server') {
+            // Full server snapshot (no deletion)
+            await createServerSnapshot(interaction, snapshotName, guild);
+        } else if (subcommand === 'categories') {
+            // Archive specific categories
+            const categoryIds = interaction.options.getString('category_ids')
+                .split(',')
+                .map(id => id.trim());
+            await archiveCategories(interaction, snapshotName, guild, categoryIds, true);
+        } else if (subcommand === 'channels') {
+            // Archive specific channels
+            const channelIds = interaction.options.getString('channel_ids')
+                .split(',')
+                .map(id => id.trim());
+            await archiveChannels(interaction, snapshotName, guild, channelIds, true);
+        }
+
+    } catch (error) {
+        console.error('❌ Error in archive command:', error);
+        if (interaction.deferred) {
+            await interaction.editReply('❌ An error occurred while archiving.');
+        } else {
+            await interaction.reply({
+                content: '❌ An error occurred while archiving.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+// Create full server snapshot
+async function createServerSnapshot(interaction, snapshotName, guild) {
+    return new Promise((resolve, reject) => {
+        db.run(
+            `INSERT INTO channel_snapshots (snapshot_name, snapshot_type, created_by, guild_id, is_full_server) VALUES (?, ?, ?, ?, ?)`,
+            [snapshotName, 'server', interaction.user.id, guild.id, 1],
+            async function(err) {
+                if (err) {
+                    await interaction.editReply('❌ Failed to create snapshot record.');
+                    reject(err);
+                    return;
+                }
+
+                const snapshotId = this.lastID;
+                let categoryCount = 0;
+                let channelCount = 0;
+
+                try {
+                    // Get all categories
+                    const categories = guild.channels.cache.filter(c => c.type === 4);
+
+                    for (const [, category] of categories) {
+                        await new Promise((res, rej) => {
+                            db.run(
+                                `INSERT INTO archived_categories (snapshot_id, category_id, category_name, position, permissions_json) VALUES (?, ?, ?, ?, ?)`,
+                                [snapshotId, category.id, category.name, category.position, serializePermissions(category)],
+                                function(err) {
+                                    if (err) rej(err);
+                                    else {
+                                        categoryCount++;
+                                        const archivedCategoryId = this.lastID;
+
+                                        // Get channels in this category
+                                        const channelsInCategory = guild.channels.cache.filter(
+                                            c => c.parentId === category.id && c.type !== 4
+                                        );
+
+                                        const channelPromises = [];
+                                        channelsInCategory.forEach(channel => {
+                                            channelPromises.push(new Promise((resC, rejC) => {
+                                                db.run(
+                                                    `INSERT INTO archived_channels (snapshot_id, archived_category_id, channel_id, channel_name, channel_type, position, topic, nsfw, rate_limit, bitrate, user_limit, permissions_json, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                                    [
+                                                        snapshotId,
+                                                        archivedCategoryId,
+                                                        channel.id,
+                                                        channel.name,
+                                                        channel.type,
+                                                        channel.position,
+                                                        channel.topic || null,
+                                                        channel.nsfw ? 1 : 0,
+                                                        channel.rateLimitPerUser || 0,
+                                                        channel.bitrate || null,
+                                                        channel.userLimit || null,
+                                                        serializePermissions(channel),
+                                                        channel.parentId
+                                                    ],
+                                                    (err) => {
+                                                        if (err) rejC(err);
+                                                        else {
+                                                            channelCount++;
+                                                            resC();
+                                                        }
+                                                    }
+                                                );
+                                            }));
+                                        });
+
+                                        Promise.all(channelPromises).then(() => res()).catch(rej);
+                                    }
+                                }
+                            );
+                        });
+                    }
+
+                    // Get uncategorized channels
+                    const uncategorizedChannels = guild.channels.cache.filter(
+                        c => !c.parentId && c.type !== 4
+                    );
+
+                    for (const [, channel] of uncategorizedChannels) {
+                        await new Promise((res, rej) => {
+                            db.run(
+                                `INSERT INTO archived_channels (snapshot_id, archived_category_id, channel_id, channel_name, channel_type, position, topic, nsfw, rate_limit, bitrate, user_limit, permissions_json, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                [
+                                    snapshotId,
+                                    null,
+                                    channel.id,
+                                    channel.name,
+                                    channel.type,
+                                    channel.position,
+                                    channel.topic || null,
+                                    channel.nsfw ? 1 : 0,
+                                    channel.rateLimitPerUser || 0,
+                                    channel.bitrate || null,
+                                    channel.userLimit || null,
+                                    serializePermissions(channel),
+                                    null
+                                ],
+                                (err) => {
+                                    if (err) rej(err);
+                                    else {
+                                        channelCount++;
+                                        res();
+                                    }
+                                }
+                            );
+                        });
+                    }
+
+                    await interaction.editReply(
+                        `✅ **Server Snapshot Created: "${snapshotName}"**\n` +
+                        `📁 Categories: ${categoryCount}\n` +
+                        `💬 Channels: ${channelCount}\n` +
+                        `🆔 Snapshot ID: ${snapshotId}`
+                    );
+
+                    console.log(`📸 Server snapshot "${snapshotName}" created by ${interaction.user.tag} - ${categoryCount} categories, ${channelCount} channels`);
+                    resolve(snapshotId);
+
+                } catch (error) {
+                    console.error('Error creating server snapshot:', error);
+                    await interaction.editReply('❌ An error occurred while creating the snapshot.');
+                    reject(error);
+                }
+            }
+        );
+    });
+}
+
+// Archive specific categories
+async function archiveCategories(interaction, snapshotName, guild, categoryIds, deleteAfter = false) {
+    return new Promise((resolve, reject) => {
+        db.run(
+            `INSERT INTO channel_snapshots (snapshot_name, snapshot_type, created_by, guild_id, is_full_server) VALUES (?, ?, ?, ?, ?)`,
+            [snapshotName, 'categories', interaction.user.id, guild.id, 0],
+            async function(err) {
+                if (err) {
+                    await interaction.editReply('❌ Failed to create snapshot record.');
+                    reject(err);
+                    return;
+                }
+
+                const snapshotId = this.lastID;
+                let categoryCount = 0;
+                let channelCount = 0;
+                const deletedCategories = [];
+                const notFound = [];
+
+                try {
+                    for (const categoryId of categoryIds) {
+                        const category = guild.channels.cache.get(categoryId);
+
+                        if (!category || category.type !== 4) {
+                            notFound.push(categoryId);
+                            continue;
+                        }
+
+                        await new Promise((res, rej) => {
+                            db.run(
+                                `INSERT INTO archived_categories (snapshot_id, category_id, category_name, position, permissions_json) VALUES (?, ?, ?, ?, ?)`,
+                                [snapshotId, category.id, category.name, category.position, serializePermissions(category)],
+                                async function(err) {
+                                    if (err) {
+                                        rej(err);
+                                        return;
+                                    }
+
+                                    categoryCount++;
+                                    const archivedCategoryId = this.lastID;
+
+                                    // Get channels in this category
+                                    const channelsInCategory = guild.channels.cache.filter(
+                                        c => c.parentId === category.id && c.type !== 4
+                                    );
+
+                                    for (const [, channel] of channelsInCategory) {
+                                        await new Promise((resC, rejC) => {
+                                            db.run(
+                                                `INSERT INTO archived_channels (snapshot_id, archived_category_id, channel_id, channel_name, channel_type, position, topic, nsfw, rate_limit, bitrate, user_limit, permissions_json, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                                [
+                                                    snapshotId,
+                                                    archivedCategoryId,
+                                                    channel.id,
+                                                    channel.name,
+                                                    channel.type,
+                                                    channel.position,
+                                                    channel.topic || null,
+                                                    channel.nsfw ? 1 : 0,
+                                                    channel.rateLimitPerUser || 0,
+                                                    channel.bitrate || null,
+                                                    channel.userLimit || null,
+                                                    serializePermissions(channel),
+                                                    channel.parentId
+                                                ],
+                                                (err) => {
+                                                    if (err) rejC(err);
+                                                    else {
+                                                        channelCount++;
+                                                        resC();
+                                                    }
+                                                }
+                                            );
+                                        });
+
+                                        // Delete channel if requested
+                                        if (deleteAfter) {
+                                            try {
+                                                await channel.delete(`Archived by ${interaction.user.tag}`);
+                                            } catch (e) {
+                                                console.error(`Failed to delete channel ${channel.name}:`, e);
+                                            }
+                                        }
+                                    }
+
+                                    // Delete category if requested
+                                    if (deleteAfter) {
+                                        try {
+                                            deletedCategories.push(category.name);
+                                            await category.delete(`Archived by ${interaction.user.tag}`);
+                                        } catch (e) {
+                                            console.error(`Failed to delete category ${category.name}:`, e);
+                                        }
+                                    }
+
+                                    res();
+                                }
+                            );
+                        });
+                    }
+
+                    let response = `✅ **Categories Archived: "${snapshotName}"**\n` +
+                        `📁 Categories: ${categoryCount}\n` +
+                        `💬 Channels: ${channelCount}\n` +
+                        `🆔 Snapshot ID: ${snapshotId}`;
+
+                    if (deleteAfter && deletedCategories.length > 0) {
+                        response += `\n🗑️ Deleted: ${deletedCategories.join(', ')}`;
+                    }
+
+                    if (notFound.length > 0) {
+                        response += `\n⚠️ Not found: ${notFound.join(', ')}`;
+                    }
+
+                    await interaction.editReply(response);
+
+                    console.log(`📸 Category archive "${snapshotName}" created by ${interaction.user.tag} - ${categoryCount} categories, ${channelCount} channels`);
+                    resolve(snapshotId);
+
+                } catch (error) {
+                    console.error('Error archiving categories:', error);
+                    await interaction.editReply('❌ An error occurred while archiving categories.');
+                    reject(error);
+                }
+            }
+        );
+    });
+}
+
+// Archive specific channels
+async function archiveChannels(interaction, snapshotName, guild, channelIds, deleteAfter = false) {
+    return new Promise((resolve, reject) => {
+        db.run(
+            `INSERT INTO channel_snapshots (snapshot_name, snapshot_type, created_by, guild_id, is_full_server) VALUES (?, ?, ?, ?, ?)`,
+            [snapshotName, 'channels', interaction.user.id, guild.id, 0],
+            async function(err) {
+                if (err) {
+                    await interaction.editReply('❌ Failed to create snapshot record.');
+                    reject(err);
+                    return;
+                }
+
+                const snapshotId = this.lastID;
+                let channelCount = 0;
+                const deletedChannels = [];
+                const notFound = [];
+
+                try {
+                    for (const channelId of channelIds) {
+                        const channel = guild.channels.cache.get(channelId);
+
+                        if (!channel || channel.type === 4) {
+                            notFound.push(channelId);
+                            continue;
+                        }
+
+                        await new Promise((res, rej) => {
+                            db.run(
+                                `INSERT INTO archived_channels (snapshot_id, archived_category_id, channel_id, channel_name, channel_type, position, topic, nsfw, rate_limit, bitrate, user_limit, permissions_json, parent_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                                [
+                                    snapshotId,
+                                    null,
+                                    channel.id,
+                                    channel.name,
+                                    channel.type,
+                                    channel.position,
+                                    channel.topic || null,
+                                    channel.nsfw ? 1 : 0,
+                                    channel.rateLimitPerUser || 0,
+                                    channel.bitrate || null,
+                                    channel.userLimit || null,
+                                    serializePermissions(channel),
+                                    channel.parentId
+                                ],
+                                async (err) => {
+                                    if (err) {
+                                        rej(err);
+                                        return;
+                                    }
+
+                                    channelCount++;
+
+                                    // Delete channel if requested
+                                    if (deleteAfter) {
+                                        try {
+                                            deletedChannels.push(channel.name);
+                                            await channel.delete(`Archived by ${interaction.user.tag}`);
+                                        } catch (e) {
+                                            console.error(`Failed to delete channel ${channel.name}:`, e);
+                                        }
+                                    }
+
+                                    res();
+                                }
+                            );
+                        });
+                    }
+
+                    let response = `✅ **Channels Archived: "${snapshotName}"**\n` +
+                        `💬 Channels: ${channelCount}\n` +
+                        `🆔 Snapshot ID: ${snapshotId}`;
+
+                    if (deleteAfter && deletedChannels.length > 0) {
+                        response += `\n🗑️ Deleted: ${deletedChannels.join(', ')}`;
+                    }
+
+                    if (notFound.length > 0) {
+                        response += `\n⚠️ Not found: ${notFound.join(', ')}`;
+                    }
+
+                    await interaction.editReply(response);
+
+                    console.log(`📸 Channel archive "${snapshotName}" created by ${interaction.user.tag} - ${channelCount} channels`);
+                    resolve(snapshotId);
+
+                } catch (error) {
+                    console.error('Error archiving channels:', error);
+                    await interaction.editReply('❌ An error occurred while archiving channels.');
+                    reject(error);
+                }
+            }
+        );
+    });
+}
+
+// Handle restore command
+async function handleRestoreCommand(interaction) {
+    try {
+        if (!isAdmin(interaction.member)) {
+            await interaction.reply({
+                content: '❌ You do not have permission to use this command.',
+                ephemeral: true
+            });
+            return;
+        }
+
+        await interaction.deferReply();
+
+        const snapshotInput = interaction.options.getString('snapshot');
+        const guild = interaction.guild;
+
+        // Find snapshot by name or ID
+        const snapshot = await new Promise((resolve, reject) => {
+            db.get(
+                `SELECT * FROM channel_snapshots WHERE (id = ? OR snapshot_name = ?) AND guild_id = ?`,
+                [snapshotInput, snapshotInput, guild.id],
+                (err, row) => {
+                    if (err) reject(err);
+                    else resolve(row);
+                }
+            );
+        });
+
+        if (!snapshot) {
+            await interaction.editReply(`❌ Snapshot "${snapshotInput}" not found.`);
+            return;
+        }
+
+        // Get archived categories
+        const archivedCategories = await new Promise((resolve, reject) => {
+            db.all(
+                `SELECT * FROM archived_categories WHERE snapshot_id = ? ORDER BY position`,
+                [snapshot.id],
+                (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows || []);
+                }
+            );
+        });
+
+        // Get archived channels
+        const archivedChannels = await new Promise((resolve, reject) => {
+            db.all(
+                `SELECT * FROM archived_channels WHERE snapshot_id = ? ORDER BY position`,
+                [snapshot.id],
+                (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows || []);
+                }
+            );
+        });
+
+        let categoryCount = 0;
+        let channelCount = 0;
+        const categoryIdMap = {}; // Map old archived_category_id to new category
+
+        // Restore categories first
+        for (const archivedCategory of archivedCategories) {
+            try {
+                const permissions = JSON.parse(archivedCategory.permissions_json || '[]');
+                const permissionOverwrites = permissions.map(p => ({
+                    id: p.id,
+                    type: p.type,
+                    allow: BigInt(p.allow),
+                    deny: BigInt(p.deny)
+                }));
+
+                const newCategory = await guild.channels.create({
+                    name: archivedCategory.category_name,
+                    type: 4, // Category
+                    position: archivedCategory.position,
+                    permissionOverwrites: permissionOverwrites
+                });
+
+                categoryIdMap[archivedCategory.id] = newCategory.id;
+                categoryCount++;
+            } catch (error) {
+                console.error(`Failed to restore category ${archivedCategory.category_name}:`, error);
+            }
+        }
+
+        // Restore channels
+        for (const archivedChannel of archivedChannels) {
+            try {
+                const permissions = JSON.parse(archivedChannel.permissions_json || '[]');
+                const permissionOverwrites = permissions.map(p => ({
+                    id: p.id,
+                    type: p.type,
+                    allow: BigInt(p.allow),
+                    deny: BigInt(p.deny)
+                }));
+
+                // Determine parent category
+                let parentId = null;
+                if (archivedChannel.archived_category_id && categoryIdMap[archivedChannel.archived_category_id]) {
+                    parentId = categoryIdMap[archivedChannel.archived_category_id];
+                }
+
+                const channelOptions = {
+                    name: archivedChannel.channel_name,
+                    type: archivedChannel.channel_type,
+                    position: archivedChannel.position,
+                    permissionOverwrites: permissionOverwrites,
+                    parent: parentId
+                };
+
+                // Add type-specific options
+                if (archivedChannel.topic) channelOptions.topic = archivedChannel.topic;
+                if (archivedChannel.nsfw) channelOptions.nsfw = true;
+                if (archivedChannel.rate_limit) channelOptions.rateLimitPerUser = archivedChannel.rate_limit;
+                if (archivedChannel.bitrate) channelOptions.bitrate = archivedChannel.bitrate;
+                if (archivedChannel.user_limit) channelOptions.userLimit = archivedChannel.user_limit;
+
+                await guild.channels.create(channelOptions);
+                channelCount++;
+            } catch (error) {
+                console.error(`Failed to restore channel ${archivedChannel.channel_name}:`, error);
+            }
+        }
+
+        await interaction.editReply(
+            `✅ **Snapshot Restored: "${snapshot.snapshot_name}"**\n` +
+            `📁 Categories restored: ${categoryCount}\n` +
+            `💬 Channels restored: ${channelCount}`
+        );
+
+        console.log(`🔄 Snapshot "${snapshot.snapshot_name}" restored by ${interaction.user.tag} - ${categoryCount} categories, ${channelCount} channels`);
+
+    } catch (error) {
+        console.error('❌ Error in restore command:', error);
+        if (interaction.deferred) {
+            await interaction.editReply('❌ An error occurred while restoring the snapshot.');
+        } else {
+            await interaction.reply({
+                content: '❌ An error occurred while restoring the snapshot.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+// Handle snapshots list/delete command
+async function handleSnapshotsCommand(interaction) {
+    try {
+        if (!isAdmin(interaction.member)) {
+            await interaction.reply({
+                content: '❌ You do not have permission to use this command.',
+                ephemeral: true
+            });
+            return;
+        }
+
+        const action = interaction.options.getString('action');
+        const snapshotInput = interaction.options.getString('snapshot');
+        const guild = interaction.guild;
+
+        if (action === 'list') {
+            await interaction.deferReply();
+
+            const snapshots = await new Promise((resolve, reject) => {
+                db.all(
+                    `SELECT cs.*,
+                        (SELECT COUNT(*) FROM archived_categories WHERE snapshot_id = cs.id) as category_count,
+                        (SELECT COUNT(*) FROM archived_channels WHERE snapshot_id = cs.id) as channel_count
+                     FROM channel_snapshots cs
+                     WHERE guild_id = ?
+                     ORDER BY created_at DESC`,
+                    [guild.id],
+                    (err, rows) => {
+                        if (err) reject(err);
+                        else resolve(rows || []);
+                    }
+                );
+            });
+
+            if (snapshots.length === 0) {
+                await interaction.editReply('📋 No snapshots found.');
+                return;
+            }
+
+            const embed = new EmbedBuilder()
+                .setColor(0x5865F2)
+                .setTitle('📸 Saved Snapshots')
+                .setDescription(
+                    snapshots.map(s => {
+                        const date = new Date(s.created_at).toLocaleDateString();
+                        const type = s.is_full_server ? '🌐 Server' : s.snapshot_type === 'categories' ? '📁 Categories' : '💬 Channels';
+                        return `**${s.id}.** ${s.snapshot_name}\n${type} | 📁 ${s.category_count} cats | 💬 ${s.channel_count} chans | ${date}`;
+                    }).join('\n\n')
+                )
+                .setFooter({ text: 'Use /restore <name or ID> to restore a snapshot' });
+
+            await interaction.editReply({ embeds: [embed] });
+
+        } else if (action === 'delete') {
+            if (!snapshotInput) {
+                await interaction.reply({
+                    content: '❌ Please specify a snapshot name or ID to delete.',
+                    ephemeral: true
+                });
+                return;
+            }
+
+            await interaction.deferReply();
+
+            const snapshot = await new Promise((resolve, reject) => {
+                db.get(
+                    `SELECT * FROM channel_snapshots WHERE (id = ? OR snapshot_name = ?) AND guild_id = ?`,
+                    [snapshotInput, snapshotInput, guild.id],
+                    (err, row) => {
+                        if (err) reject(err);
+                        else resolve(row);
+                    }
+                );
+            });
+
+            if (!snapshot) {
+                await interaction.editReply(`❌ Snapshot "${snapshotInput}" not found.`);
+                return;
+            }
+
+            // Delete associated data
+            await new Promise((resolve, reject) => {
+                db.run(`DELETE FROM archived_channels WHERE snapshot_id = ?`, [snapshot.id], (err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            });
+
+            await new Promise((resolve, reject) => {
+                db.run(`DELETE FROM archived_categories WHERE snapshot_id = ?`, [snapshot.id], (err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            });
+
+            await new Promise((resolve, reject) => {
+                db.run(`DELETE FROM channel_snapshots WHERE id = ?`, [snapshot.id], (err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            });
+
+            await interaction.editReply(`✅ Snapshot "${snapshot.snapshot_name}" (ID: ${snapshot.id}) has been deleted.`);
+
+            console.log(`🗑️ Snapshot "${snapshot.snapshot_name}" deleted by ${interaction.user.tag}`);
+        }
+
+    } catch (error) {
+        console.error('❌ Error in snapshots command:', error);
+        if (interaction.deferred) {
+            await interaction.editReply('❌ An error occurred while managing snapshots.');
+        } else {
+            await interaction.reply({
+                content: '❌ An error occurred while managing snapshots.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+// ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
@@ -6416,7 +7209,10 @@ const commandHandlers = {
     'admin_leaderboard': handleAdminLeaderboard,
     'setupshops': setupShops,
     'rolesnapshot': handleRoleSnapshot,
-    'massrole': handleMassRole
+    'massrole': handleMassRole,
+    'archive': handleArchiveCommand,
+    'restore': handleRestoreCommand,
+    'snapshots': handleSnapshotsCommand
 };
 
 // Main command handler function
@@ -7150,6 +7946,41 @@ client.on(Events.InteractionCreate, async interaction => {
                 }
                 return;
             }
+
+            // Autocomplete for restore and snapshots commands
+            if ((commandName === 'restore' || commandName === 'snapshots') && focusedOption.name === 'snapshot') {
+                const focusedValue = focusedOption.value.toLowerCase();
+
+                try {
+                    const snapshots = await new Promise((resolve, reject) => {
+                        db.all(
+                            `SELECT id, snapshot_name, snapshot_type, is_full_server FROM channel_snapshots WHERE guild_id = ? ORDER BY created_at DESC LIMIT 25`,
+                            [interaction.guild.id],
+                            (err, rows) => {
+                                if (err) reject(err);
+                                else resolve(rows || []);
+                            }
+                        );
+                    });
+
+                    const choices = snapshots
+                        .filter(s => s.snapshot_name.toLowerCase().includes(focusedValue) || s.id.toString().includes(focusedValue))
+                        .slice(0, 25)
+                        .map(s => {
+                            const type = s.is_full_server ? '🌐' : s.snapshot_type === 'categories' ? '📁' : '💬';
+                            return {
+                                name: `${type} ${s.snapshot_name} (ID: ${s.id})`,
+                                value: s.id.toString()
+                            };
+                        });
+
+                    await interaction.respond(choices);
+                } catch (error) {
+                    console.error('Snapshot autocomplete error:', error);
+                    await interaction.respond([]);
+                }
+                return;
+            }
         }
 
         // ============================================================================
@@ -7210,6 +8041,9 @@ if (interaction.isChatInputCommand()) {
         case 'setupshops':
         case 'rolesnapshot':
         case 'massrole':
+        case 'archive':
+        case 'restore':
+        case 'snapshots':
             if (!isAdmin(interaction.member)) {
                 await interaction.reply({
                     content: 'You do not have permission to use this command.',
@@ -7252,6 +8086,15 @@ if (interaction.isChatInputCommand()) {
                     break;
                 case 'massrole':
                     await handleMassRole(interaction);
+                    break;
+                case 'archive':
+                    await handleArchiveCommand(interaction);
+                    break;
+                case 'restore':
+                    await handleRestoreCommand(interaction);
+                    break;
+                case 'snapshots':
+                    await handleSnapshotsCommand(interaction);
                     break;
             }
             break;
