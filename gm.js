@@ -508,6 +508,40 @@ async function runDatabaseMigrations() {
         });
     }
 
+    // Migration 4: Add unique constraint to memory_associations
+    if (currentVersion < 4) {
+        await applyMigration(4, 'Add unique constraint to memory_associations', (done) => {
+            // SQLite doesn't support ALTER TABLE to add constraints, need to recreate table
+            aiDb.run(`CREATE TABLE IF NOT EXISTS memory_associations_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id_1 INTEGER NOT NULL,
+                memory_id_2 INTEGER NOT NULL,
+                association_type TEXT,
+                strength REAL DEFAULT 0.5,
+                UNIQUE(memory_id_1, memory_id_2),
+                FOREIGN KEY (memory_id_1) REFERENCES user_memory(id),
+                FOREIGN KEY (memory_id_2) REFERENCES user_memory(id)
+            )`, (err) => {
+                if (err) return done(err);
+
+                // Copy existing data
+                aiDb.run(`INSERT OR IGNORE INTO memory_associations_new
+                         SELECT * FROM memory_associations`, (err) => {
+                    if (err && !err.message.includes('no such table')) {
+                        return done(err);
+                    }
+
+                    // Drop old table and rename new one
+                    aiDb.run(`DROP TABLE IF EXISTS memory_associations`, (err) => {
+                        if (err) return done(err);
+
+                        aiDb.run(`ALTER TABLE memory_associations_new RENAME TO memory_associations`, done);
+                    });
+                });
+            });
+        });
+    }
+
     console.log('✅ All database migrations completed');
 }
 
@@ -699,17 +733,17 @@ function getRandomResponse(responseArray) {
 
 // [REMOVED] enhancePersonalityWithGifts function (part of removed gift system)
 
-// Store a fact about a user in memory
+// Store a fact about a user in memory (returns memory ID for linking)
 async function storeUserFact(userId, fact, category = 'general', confidence = 1.0, source = null) {
     return new Promise((resolve, reject) => {
         const now = Date.now();
-        
+
         console.log(`💭 Storing memory for user ${userId}: "${fact}" (${category})`);
-        
+
         aiDb.run(
             `INSERT INTO user_memory (user_id, fact, category, confidence, created_at, last_accessed, source)
              VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(user_id, fact) 
+             ON CONFLICT(user_id, fact)
              DO UPDATE SET confidence = MAX(confidence, ?), last_accessed = ?, source = COALESCE(?, source)`,
             [userId, fact, category, confidence, now, now, source, confidence, now, source],
             function(err) {
@@ -718,7 +752,16 @@ async function storeUserFact(userId, fact, category = 'general', confidence = 1.
                     return reject(err);
                 }
                 console.log(`✅ Memory stored successfully: ${this.changes} row(s) affected`);
-                resolve();
+
+                // Get the memory ID (either just inserted or existing)
+                aiDb.get(
+                    'SELECT id FROM user_memory WHERE user_id = ? AND fact = ?',
+                    [userId, fact],
+                    (err, row) => {
+                        if (err) return reject(err);
+                        resolve(row ? row.id : null);
+                    }
+                );
             }
         );
     });
@@ -728,7 +771,7 @@ async function storeUserFact(userId, fact, category = 'general', confidence = 1.
 async function getUserMemories(userId, category = null, limit = 15) {
     return new Promise((resolve, reject) => {
         const now = Date.now();
-        let query = 'SELECT fact, category, confidence FROM user_memory WHERE user_id = ?';
+        let query = 'SELECT id, fact, category, confidence FROM user_memory WHERE user_id = ?';
         const params = [userId];
         
         if (category) {
@@ -1036,10 +1079,15 @@ async function processMemoryTriggers(userId, userMessage, botResponse, message =
                     
                     if (facts.length > 0) {
                         for (const factObj of facts) {
-                            await storeUserFact(userId, factObj.fact, factObj.category, 0.9, 'conversation');
+                            const memoryId = await storeUserFact(userId, factObj.fact, factObj.category, 0.9, 'conversation');
                             console.log(`💾 Stored fact: "${factObj.fact}" (${factObj.category})`);
+
+                            // Auto-link related memories
+                            if (memoryId) {
+                                await autoLinkMemories(userId, factObj.fact, memoryId);
+                            }
                         }
-                        
+
                         // Send acknowledgment if message object is provided and user explicitly asked to remember
                         if (message && lowerMessage.includes('remember that')) {
                             const acknowledgment = await getMemoryAcknowledgment(facts[0].fact);
@@ -1160,17 +1208,40 @@ async function trackInteraction(userId, channelId, interactionType = 'message', 
 // Store a special date (birthday, anniversary, etc.)
 async function storeSpecialDate(userId, dateType, timestamp, description = null, recurring = true) {
     return new Promise((resolve, reject) => {
-        aiDb.run(`
-            INSERT INTO special_dates
-            (user_id, date_type, date_timestamp, description, recurring, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `, [userId, dateType, timestamp, description, recurring ? 1 : 0, Date.now()], (err) => {
-            if (err) reject(err);
-            else {
-                console.log(`🎂 Stored ${dateType} for user ${userId}`);
-                resolve();
+        // Check if this exact date already exists for this user
+        aiDb.get(
+            'SELECT id FROM special_dates WHERE user_id = ? AND date_type = ? AND date_timestamp = ?',
+            [userId, dateType, timestamp],
+            (err, existing) => {
+                if (err) return reject(err);
+
+                if (existing) {
+                    console.log(`📅 ${dateType} already stored for user ${userId}, updating...`);
+                    // Update existing entry
+                    aiDb.run(
+                        `UPDATE special_dates SET description = ?, recurring = ? WHERE id = ?`,
+                        [description, recurring ? 1 : 0, existing.id],
+                        (err) => {
+                            if (err) reject(err);
+                            else resolve();
+                        }
+                    );
+                } else {
+                    // Insert new entry
+                    aiDb.run(`
+                        INSERT INTO special_dates
+                        (user_id, date_type, date_timestamp, description, recurring, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    `, [userId, dateType, timestamp, description, recurring ? 1 : 0, Date.now()], (err) => {
+                        if (err) reject(err);
+                        else {
+                            console.log(`🎂 Stored ${dateType} for user ${userId}`);
+                            resolve();
+                        }
+                    });
+                }
             }
-        });
+        );
     });
 }
 
@@ -1240,16 +1311,15 @@ function getTemporalContext() {
 async function enhancedProcessMemoryTriggers(userId, userMessage, username) {
     const lowerMessage = userMessage.toLowerCase();
 
-    // Enhanced birthday detection patterns
+    // Enhanced birthday detection patterns (ordered by specificity)
+    // Note: Must match month name (letters) + day number to be valid
     const birthdayPatterns = [
-        /my birthday is (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
-        /birthday is (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
-        /i was born (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
-        /born (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
-        /bday is (?:on )?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
-        /birthday.*?(\w+\s+\d+(?:st|nd|rd|th)?)/i,
-        /(\d+)\/(\d+)/,  // Matches 12/25 or 5/15 format
-        /(\w+)\s+(\d+)(?:st|nd|rd|th)?/  // Fallback for "May 15" or "May 15th"
+        /my birthday is (?:on )?([a-zA-Z]+\s+\d+(?:st|nd|rd|th)?)/i,
+        /birthday is (?:on )?([a-zA-Z]+\s+\d+(?:st|nd|rd|th)?)/i,
+        /bday is (?:on )?([a-zA-Z]+\s+\d+(?:st|nd|rd|th)?)/i,
+        /(?:i was born|im born|i'm born) (?:on )?([a-zA-Z]+\s+\d+(?:st|nd|rd|th)?)/i,  // Must have month name
+        /(?:^|\s)born (?:on )?([a-zA-Z]+\s+\d+(?:st|nd|rd|th)?)(?:\s|$)/i,  // Must have month name
+        /(\d{1,2})\/(\d{1,2})/,  // Matches 12/25 or 5/15 format
     ];
 
     for (const pattern of birthdayPatterns) {
@@ -1282,7 +1352,9 @@ async function enhancedProcessMemoryTriggers(userId, userMessage, username) {
                     await storeUserFact(userId, `Birthday is on ${dateStr}`, 'personal', 1.0, 'detected');
 
                     console.log(`✅ Birthday stored successfully for ${username}!`);
-                    return true;
+
+                    // Don't return yet - check for year in the same message
+                    break;
                 }
             } catch (err) {
                 console.error('❌ Error parsing birthday:', err);
@@ -1290,7 +1362,273 @@ async function enhancedProcessMemoryTriggers(userId, userMessage, username) {
         }
     }
 
+    // Detect birth year patterns (check 4-digit years first, then ages)
+    const birthYearPatterns = [
+        /(?:born|birthday).*?(\d{4})/i,  // "born november 1st 1995" or "birthday is may 1 1995"
+        /(\d{4}).*?(?:born|birthday)/i,  // "1995 was when I was born"
+        /(?:im|i'm|i am) (\d{2})\s*(?:years old)?/i,  // "i'm 25" or "i'm 25 years old"
+        /(?:age|turning|turned) (\d{2})/i,  // "turning 25" or "just turned 25"
+    ];
+
+    for (const pattern of birthYearPatterns) {
+        const match = userMessage.match(pattern);
+        if (match) {
+            try {
+                let birthYear;
+                const captured = match[1];
+
+                // If they said their age, calculate birth year
+                if (captured.length === 2) {
+                    const age = parseInt(captured);
+                    const currentYear = new Date().getFullYear();
+                    birthYear = currentYear - age;
+                } else {
+                    // They gave the year directly
+                    birthYear = parseInt(captured);
+                }
+
+                // Sanity check (reasonable birth years)
+                if (birthYear >= 1940 && birthYear <= new Date().getFullYear()) {
+                    console.log(`📅 Detected birth year for ${username}: ${birthYear}`);
+                    await updateUserProfile(userId, username, { birthday_year: birthYear });
+                    await storeUserFact(userId, `Born in ${birthYear}`, 'personal', 1.0, 'detected');
+                    console.log(`✅ Birth year stored successfully!`);
+                    return true;
+                }
+            } catch (err) {
+                console.error('❌ Error parsing birth year:', err);
+            }
+        }
+    }
+
+    // Detect timezone patterns
+    const timezonePatterns = [
+        /i'?m in ([\w\/]+) time/i,
+        /my timezone is ([\w\/]+)/i,
+        /(?:^|\s)(EST|PST|CST|MST|EDT|PDT|CDT|MDT|JST|UTC|GMT|KST|AEST)(?:\s|$)/i,
+        /(?:live in|from) (New York|Los Angeles|Chicago|London|Tokyo|Sydney|Paris|Berlin|Toronto|Vancouver|Seoul|Beijing|Shanghai|Hong Kong|Singapore|Dubai|Mumbai)/i
+    ];
+
+    const timezoneMap = {
+        'EST': 'America/New_York',
+        'EDT': 'America/New_York',
+        'PST': 'America/Los_Angeles',
+        'PDT': 'America/Los_Angeles',
+        'CST': 'America/Chicago',
+        'CDT': 'America/Chicago',
+        'MST': 'America/Denver',
+        'MDT': 'America/Denver',
+        'JST': 'Asia/Tokyo',
+        'KST': 'Asia/Seoul',
+        'AEST': 'Australia/Sydney',
+        'UTC': 'UTC',
+        'GMT': 'Europe/London',
+        'New York': 'America/New_York',
+        'Los Angeles': 'America/Los_Angeles',
+        'Chicago': 'America/Chicago',
+        'London': 'Europe/London',
+        'Tokyo': 'Asia/Tokyo',
+        'Sydney': 'Australia/Sydney',
+        'Paris': 'Europe/Paris',
+        'Berlin': 'Europe/Berlin',
+        'Toronto': 'America/Toronto',
+        'Vancouver': 'America/Vancouver',
+        'Seoul': 'Asia/Seoul',
+        'Beijing': 'Asia/Shanghai',
+        'Shanghai': 'Asia/Shanghai',
+        'Hong Kong': 'Asia/Hong_Kong',
+        'Singapore': 'Asia/Singapore',
+        'Dubai': 'Asia/Dubai',
+        'Mumbai': 'Asia/Kolkata'
+    };
+
+    for (const pattern of timezonePatterns) {
+        const match = userMessage.match(pattern);
+        if (match) {
+            try {
+                let timezone = match[1];
+
+                // Capitalize first letter for city names to match the map
+                const capitalizedTz = timezone.charAt(0).toUpperCase() + timezone.slice(1).toLowerCase();
+
+                // Try exact match first, then capitalized version, then uppercase (for abbreviations)
+                if (timezoneMap[timezone]) {
+                    timezone = timezoneMap[timezone];
+                } else if (timezoneMap[capitalizedTz]) {
+                    timezone = timezoneMap[capitalizedTz];
+                } else if (timezoneMap[timezone.toUpperCase()]) {
+                    timezone = timezoneMap[timezone.toUpperCase()];
+                }
+
+                console.log(`🌍 Detected timezone for ${username}: ${timezone}`);
+                await updateUserProfile(userId, username, { timezone });
+                await storeUserFact(userId, `Timezone is ${timezone}`, 'personal', 1.0, 'detected');
+                console.log(`✅ Timezone stored successfully!`);
+                return true;
+            } catch (err) {
+                console.error('❌ Error storing timezone:', err);
+            }
+        }
+    }
+
     return false;
+}
+
+// ============================================================================
+// FAVORITE TOPICS & MEMORY ASSOCIATIONS
+// ============================================================================
+
+// Detect and track topics user talks about frequently
+async function detectAndTrackTopics(userId, username, userMessage) {
+    const lowerMessage = userMessage.toLowerCase();
+
+    // Topic detection patterns with categories
+    const topicPatterns = {
+        gaming: /\b(game|gaming|play|playing|steam|xbox|playstation|nintendo|pc gaming|mobile game|valorant|league|minecraft|fortnite|genshin|fps|rpg|mmo)\b/i,
+        anime: /\b(anime|manga|episode|season|chapter|weeb|otaku|shounen|seinen|isekai|crunchyroll|funimation)\b/i,
+        food: /\b(food|cook|cooking|recipe|restaurant|eat|eating|hungry|delicious|yummy|bake|baking|chef|cuisine)\b/i,
+        music: /\b(music|song|album|artist|band|concert|listen|spotify|playlist|beat|melody|guitar|piano|rap|pop|rock)\b/i,
+        art: /\b(art|draw|drawing|paint|painting|sketch|digital art|commission|artist|canvas|illustration|design)\b/i,
+        tech: /\b(tech|technology|coding|programming|developer|software|hardware|computer|laptop|pc|setup|build)\b/i,
+        sports: /\b(sport|sports|football|basketball|soccer|baseball|gym|workout|fitness|exercise|training|athlete)\b/i,
+        movies: /\b(movie|film|cinema|watch|watching|netflix|director|actor|series|show|episode|documentary)\b/i,
+        books: /\b(book|reading|novel|author|story|chapter|library|kindle|literature|fiction|fantasy)\b/i,
+        travel: /\b(travel|trip|vacation|visit|country|city|flight|hotel|tourist|explore|adventure|journey)\b/i,
+        pets: /\b(pet|dog|cat|puppy|kitten|animal|cute|fluffy|paw|furry|bird|fish|hamster)\b/i,
+        fashion: /\b(fashion|style|clothes|outfit|wear|wearing|dress|shirt|shoes|sneakers|aesthetic|drip)\b/i,
+        photography: /\b(photo|photography|camera|picture|shot|lens|capture|photographer|instagram|snap)\b/i,
+        nature: /\b(nature|outdoor|hiking|camping|mountain|forest|beach|ocean|sunset|sunrise|landscape)\b/i
+    };
+
+    const detectedTopics = [];
+    for (const [topic, pattern] of Object.entries(topicPatterns)) {
+        if (pattern.test(userMessage)) {
+            detectedTopics.push(topic);
+        }
+    }
+
+    if (detectedTopics.length > 0) {
+        console.log(`💬 Detected topics for ${username}: ${detectedTopics.join(', ')}`);
+        await updateUserTopics(userId, username, detectedTopics);
+        return detectedTopics;
+    }
+
+    return [];
+}
+
+// Update user's favorite topics based on frequency
+async function updateUserTopics(userId, username, newTopics) {
+    const profile = await getUserProfile(userId);
+    if (!profile) return;
+
+    // Parse existing topics (stored as JSON)
+    let topicCounts = {};
+    if (profile.favorite_topics) {
+        try {
+            topicCounts = JSON.parse(profile.favorite_topics);
+        } catch (e) {
+            topicCounts = {};
+        }
+    }
+
+    // Increment counts for detected topics
+    for (const topic of newTopics) {
+        topicCounts[topic] = (topicCounts[topic] || 0) + 1;
+    }
+
+    // Sort by frequency and keep top 5
+    const sortedTopics = Object.entries(topicCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5);
+
+    const topicsJSON = JSON.stringify(Object.fromEntries(sortedTopics));
+
+    await updateUserProfile(userId, username, { favorite_topics: topicsJSON });
+
+    // Store as memory if this is a strong interest (mentioned 3+ times)
+    for (const [topic, count] of sortedTopics) {
+        if (count === 3) {
+            await storeUserFact(userId, `Interested in ${topic}`, 'interest', 0.8, 'detected');
+            console.log(`✨ ${username} shows strong interest in ${topic} (mentioned ${count} times)`);
+        }
+    }
+}
+
+// Get user's favorite topics
+async function getUserFavoriteTopics(userId) {
+    const profile = await getUserProfile(userId);
+    if (!profile || !profile.favorite_topics) return [];
+
+    try {
+        const topicCounts = JSON.parse(profile.favorite_topics);
+        return Object.keys(topicCounts);
+    } catch (e) {
+        return [];
+    }
+}
+
+// Store memory association - link related memories together
+async function storeMemoryAssociation(memory1Id, memory2Id, associationType = 'related', strength = 0.5) {
+    return new Promise((resolve, reject) => {
+        aiDb.run(
+            `INSERT INTO memory_associations (memory_id_1, memory_id_2, association_type, strength)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(memory_id_1, memory_id_2) DO UPDATE SET strength = ?, association_type = ?`,
+            [memory1Id, memory2Id, associationType, strength, strength, associationType],
+            function(err) {
+                if (err) {
+                    console.error('❌ Error storing memory association:', err);
+                    return reject(err);
+                }
+                console.log(`🔗 Linked memories ${memory1Id} ↔ ${memory2Id} (${associationType})`);
+                resolve();
+            }
+        );
+    });
+}
+
+// Get associated memories for a given memory
+async function getAssociatedMemories(memoryId, minStrength = 0.3) {
+    return new Promise((resolve, reject) => {
+        aiDb.all(
+            `SELECT ma.memory_id_2 as related_id, ma.association_type, ma.strength,
+                    um.fact, um.category, um.confidence
+             FROM memory_associations ma
+             JOIN user_memory um ON ma.memory_id_2 = um.id
+             WHERE ma.memory_id_1 = ? AND ma.strength >= ?
+             ORDER BY ma.strength DESC
+             LIMIT 5`,
+            [memoryId, minStrength],
+            (err, rows) => {
+                if (err) return reject(err);
+                resolve(rows || []);
+            }
+        );
+    });
+}
+
+// Auto-detect and create memory associations when storing facts
+async function autoLinkMemories(userId, newFact, newFactId) {
+    // Get recent memories from the same user
+    const recentMemories = await getUserMemories(userId, null, 20);
+
+    for (const memory of recentMemories) {
+        // Simple topic matching - if facts share keywords, they might be related
+        const newFactWords = new Set(newFact.toLowerCase().split(/\W+/).filter(w => w.length > 3));
+        const memoryWords = new Set(memory.fact.toLowerCase().split(/\W+/).filter(w => w.length > 3));
+
+        const commonWords = [...newFactWords].filter(w => memoryWords.has(w));
+
+        if (commonWords.length >= 2) {
+            // Found related memories
+            const strength = Math.min(commonWords.length / 3, 1.0); // More common words = stronger link
+            try {
+                await storeMemoryAssociation(newFactId, memory.id, 'topical', strength);
+            } catch (e) {
+                // Ignore if memory IDs don't exist yet
+            }
+        }
+    }
 }
 
 // Get relationship context for a user
@@ -1847,12 +2185,29 @@ async function sendBirthdayWish(userId, username) {
             return;
         }
 
+        // Get user profile to check if we have their birth year
+        const profile = await getUserProfile(userId);
+        let age = null;
+        if (profile && profile.birthday_year) {
+            age = new Date().getFullYear() - profile.birthday_year;
+        }
+
         // Generate personalized birthday message using AI
-        const birthdayPrompt = `Generate a warm, friendly birthday message for ${username}.
-        Keep it short (1-2 sentences), casual, and genuine.
-        Use Ochako's personality (16-year-old girl, sassy but kind).
-        Examples: "happy birthday! hope you have an awesome day 🎉" or "omg it's your birthday! have the best day ever 🎂"
-        Don't use their name in the message.`;
+        let birthdayPrompt;
+        if (age) {
+            birthdayPrompt = `Generate a warm, friendly birthday message for ${username} who is turning ${age} years old.
+            Keep it short (1-2 sentences), casual, and genuine.
+            Use Ochako's personality (16-year-old girl, sassy but kind).
+            Mention their age naturally in the message.
+            Examples: "happy ${age}th birthday! hope you have an amazing day 🎉" or "omg you're ${age} now! have the best birthday ever 🎂"
+            Don't use their name in the message.`;
+        } else {
+            birthdayPrompt = `Generate a warm, friendly birthday message for ${username}.
+            Keep it short (1-2 sentences), casual, and genuine.
+            Use Ochako's personality (16-year-old girl, sassy but kind).
+            Examples: "happy birthday! hope you have an awesome day 🎉" or "omg it's your birthday! have the best day ever 🎂"
+            Don't use their name in the message.`;
+        }
 
         const response = await openai.chat.completions.create({
             model: 'gpt-4o-mini',
@@ -1868,10 +2223,10 @@ async function sendBirthdayWish(userId, username) {
 
         // Send DM
         await user.send(birthdayMessage);
-        console.log(`🎂 Sent birthday wish to ${username}`);
+        console.log(`🎂 Sent birthday wish to ${username}${age ? ` (turning ${age})` : ''}`);
 
         // Store as a special memory
-        await storeUserFact(userId, `Birthday celebrated on ${new Date().toLocaleDateString()}`, 'event', 1.0, 'birthday_wish');
+        await storeUserFact(userId, `Birthday celebrated on ${new Date().toLocaleDateString()}${age ? ` (turned ${age})` : ''}`, 'event', 1.0, 'birthday_wish');
 
     } catch (error) {
         console.error(`❌ Error sending birthday wish to ${username}:`, error);
@@ -1879,125 +2234,9 @@ async function sendBirthdayWish(userId, username) {
 }
 
 // ============================================================================
-// RANDOM CHAT FUNCTIONS
+// RANDOM CHAT FUNCTIONS (Moved to lines 6467-6581 to avoid duplication)
 // ============================================================================
-
-// Schedule random message sending
-function scheduleRandomMessage() {
-    const delay = Math.random() * (MAX_MESSAGE_INTERVAL - MIN_MESSAGE_INTERVAL) + MIN_MESSAGE_INTERVAL;
-
-    setTimeout(async () => {
-        try {
-            // Pick a random channel
-            const channelId = RANDOM_CHAT_CHANNELS[Math.floor(Math.random() * RANDOM_CHAT_CHANNELS.length)];
-            const channel = client.channels.cache.get(channelId);
-
-            if (!channel) {
-                scheduleRandomMessage();
-                return;
-            }
-
-            // Check if appropriate to send
-            if (!await shouldSendRandomMessage(channelId)) {
-                scheduleRandomMessage();
-                return;
-            }
-
-            // Generate and send message
-            const message = await generateRandomMessage(channel);
-            const sentMessage = await channel.send(message);
-
-            // Store in conversation context
-            await storeConversationMessage(
-                channelId,
-                sentMessage.id,
-                client.user.id,
-                client.user.username,
-                message,
-                true
-            );
-
-            // Mark as recently active
-            recentlyActive.add(channelId);
-            setTimeout(() => recentlyActive.delete(channelId), 600000); // 10 minute cooldown
-
-            console.log(`🤖 Sent random message to ${channel.name}`);
-        } catch (error) {
-            console.error('❌ Error sending random message:', error);
-        }
-
-        // Schedule next random message
-        scheduleRandomMessage();
-    }, delay);
-}
-
-// Check if appropriate to send random message
-async function shouldSendRandomMessage(channelId) {
-    // Get recent conversation activity
-    const recentContext = await getChannelContext(channelId, 10);
-    if (recentContext.length === 0) return false;
-
-    // Check last message time
-    const lastMessageTime = recentContext[recentContext.length - 1].timestamp || 0;
-    const timeSinceLastMessage = Date.now() - lastMessageTime;
-
-    // Don't send if conversation is too old (> 2 hours) or too recent (< 2 minutes)
-    if (timeSinceLastMessage > 7200000 || timeSinceLastMessage < 120000) return false;
-
-    // Check if bot last message was too recent
-    const lastBotMessage = recentContext.filter(msg => msg.is_bot).pop();
-    if (lastBotMessage) {
-        const timeSinceBotMessage = Date.now() - (lastBotMessage.timestamp || 0);
-        if (timeSinceBotMessage < 600000) return false; // 10 minute cooldown
-    }
-
-    // Check active users
-    const activeUsers = await getActiveUsersInConversation(channelId, 3600000); // 1 hour
-    return activeUsers.length >= 2; // At least 2 people talking
-}
-
-// Enhanced random message with context awareness
-async function generateRandomMessage(channel) {
-    try {
-        // Get conversation context
-        const recentContext = await getChannelContext(channel.id, 10);
-        const activeUsers = await getActiveUsersInConversation(channel.id);
-
-        // Sometimes reference recent conversation (30% chance)
-        if (Math.random() < 0.3 && recentContext.length > 0) {
-            const recentTopics = recentContext.map(msg => msg.content).join(' ');
-
-            const response = await openai.chat.completions.create({
-                model: 'gpt-4o-mini',
-                messages: [
-                    {
-                        role: 'system',
-                        content: casualPersonality +
-                        '\n\nYou want to jump into the conversation naturally. Reference something that was said earlier or ask a follow-up question. Keep it short and casual.'
-                    },
-                    ...recentContext.slice(-5).map(msg => ({
-                        role: msg.is_bot ? 'assistant' : 'user',
-                        content: msg.is_bot ? msg.content : `${msg.username}: ${msg.content}`
-                    })),
-                    {
-                        role: 'user',
-                        content: 'Generate a natural message to continue or revive this conversation'
-                    }
-                ],
-                temperature: 0.9,
-                max_tokens: 100
-            });
-
-            return response.choices[0].message.content;
-        }
-
-        // Otherwise use time-based starter
-        return getTimeBasedStarter();
-    } catch (error) {
-        console.error('❌ Error generating random message:', error);
-        return getTimeBasedStarter();
-    }
-}
+// Note: Random chat functions are defined later in the file near main event handlers
 
 // Remove user memory by keyword
 async function removeUserMemory(userId, keyword) {
@@ -4497,7 +4736,27 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('setupshops')
-        .setDescription('Setup or refresh shops (Admin only)')
+        .setDescription('Setup or refresh shops (Admin only)'),
+
+    new SlashCommandBuilder()
+        .setName('rolesnapshot')
+        .setDescription('Get a CSV snapshot of all members with a specific role (Admin only)')
+        .addRoleOption(option =>
+            option.setName('role')
+                .setDescription('The role to snapshot')
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('massrole')
+        .setDescription('Give a role to all members who have another role (Admin only)')
+        .addRoleOption(option =>
+            option.setName('has_role')
+                .setDescription('Members must have this role')
+                .setRequired(true))
+        .addRoleOption(option =>
+            option.setName('give_role')
+                .setDescription('The role to give them')
+                .setRequired(true))
 ];
 
 
@@ -4512,7 +4771,7 @@ function verifyCommands() {
         'equipment', 'equip', 'unequip', 'inventory', 'trade', 'convert',
         'poll', 'raffle', 'archive',
         'admin_items', 'admin_inventory', 'admin_update', 'admin_searchitem',
-        'admin_item', 'admin_give', 'admin_stats', 'admin_leaderboard', 'setupshops'
+        'admin_item', 'admin_give', 'admin_stats', 'admin_leaderboard', 'setupshops', 'rolesnapshot', 'massrole'
     ];
 
     console.log('=== COMMAND VERIFICATION ===');
@@ -5855,6 +6114,171 @@ async function handleAdminLeaderboard(interaction) {
     }
 }
 
+// Handle role snapshot command - exports members with a specific role to CSV
+async function handleRoleSnapshot(interaction) {
+    try {
+        // Check admin permissions
+        if (!isAdmin(interaction.member)) {
+            await interaction.reply({
+                content: '❌ You do not have permission to use this command.',
+                ephemeral: true
+            });
+            return;
+        }
+
+        await interaction.deferReply();
+
+        const targetRole = interaction.options.getRole('role');
+        const guild = interaction.guild;
+
+        // Fetch all members to ensure cache is populated
+        await guild.members.fetch();
+
+        // Get all members with the target role
+        const membersWithRole = guild.members.cache.filter(member =>
+            member.roles.cache.has(targetRole.id)
+        );
+
+        if (membersWithRole.size === 0) {
+            await interaction.editReply(`No members found with the role **${targetRole.name}**.`);
+            return;
+        }
+
+        // Build CSV content
+        const csvHeader = 'Username,Display Name,User ID,Other Roles';
+        const csvRows = membersWithRole.map(member => {
+            const username = `"${member.user.username.replace(/"/g, '""')}"`;
+            const displayName = `"${member.displayName.replace(/"/g, '""')}"`;
+            const userId = member.user.id;
+
+            // Get other roles (excluding @everyone and the target role)
+            const otherRoles = member.roles.cache
+                .filter(role => role.id !== guild.id && role.id !== targetRole.id)
+                .map(role => role.name)
+                .join('; ');
+            const otherRolesEscaped = `"${otherRoles.replace(/"/g, '""')}"`;
+
+            return `${username},${displayName},${userId},${otherRolesEscaped}`;
+        });
+
+        const csvContent = [csvHeader, ...csvRows].join('\n');
+
+        // Check if content is too long for a message
+        if (csvContent.length > 1900) {
+            // Send as file attachment
+            const buffer = Buffer.from(csvContent, 'utf-8');
+            const attachment = new AttachmentBuilder(buffer, {
+                name: `role_snapshot_${targetRole.name.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.csv`
+            });
+
+            await interaction.editReply({
+                content: `📋 **Role Snapshot: ${targetRole.name}**\nFound **${membersWithRole.size}** members with this role.`,
+                files: [attachment]
+            });
+        } else {
+            // Send as code block in message
+            await interaction.editReply(
+                `📋 **Role Snapshot: ${targetRole.name}**\nFound **${membersWithRole.size}** members with this role.\n\`\`\`csv\n${csvContent}\n\`\`\``
+            );
+        }
+
+        console.log(`📋 Role snapshot generated for "${targetRole.name}" by ${interaction.user.tag} - ${membersWithRole.size} members`);
+
+    } catch (error) {
+        console.error('❌ Error in role snapshot command:', error);
+        if (interaction.deferred) {
+            await interaction.editReply('❌ An error occurred while generating the role snapshot.');
+        } else {
+            await interaction.reply({
+                content: '❌ An error occurred while generating the role snapshot.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
+// Handle mass role command - give a role to all members who have another role
+async function handleMassRole(interaction) {
+    try {
+        // Check admin permissions
+        if (!isAdmin(interaction.member)) {
+            await interaction.reply({
+                content: '❌ You do not have permission to use this command.',
+                ephemeral: true
+            });
+            return;
+        }
+
+        await interaction.deferReply();
+
+        const hasRole = interaction.options.getRole('has_role');
+        const giveRole = interaction.options.getRole('give_role');
+        const guild = interaction.guild;
+
+        // Check if the bot can manage the role
+        const botMember = guild.members.me;
+        if (giveRole.position >= botMember.roles.highest.position) {
+            await interaction.editReply('❌ I cannot assign that role because it is higher than or equal to my highest role.');
+            return;
+        }
+
+        // Fetch all members to ensure cache is populated
+        await guild.members.fetch();
+
+        // Get all members with the source role who don't already have the target role
+        const membersToUpdate = guild.members.cache.filter(member =>
+            member.roles.cache.has(hasRole.id) && !member.roles.cache.has(giveRole.id)
+        );
+
+        if (membersToUpdate.size === 0) {
+            await interaction.editReply(`No members found with **${hasRole.name}** who don't already have **${giveRole.name}**.`);
+            return;
+        }
+
+        // Add the role to each member
+        let successCount = 0;
+        let failCount = 0;
+        const failedMembers = [];
+
+        for (const [, member] of membersToUpdate) {
+            try {
+                await member.roles.add(giveRole);
+                successCount++;
+            } catch (error) {
+                failCount++;
+                failedMembers.push(member.user.tag);
+                console.error(`Failed to add role to ${member.user.tag}:`, error.message);
+            }
+        }
+
+        // Build response
+        let response = `✅ **Mass Role Complete**\n`;
+        response += `Added **${giveRole.name}** to **${successCount}** members who had **${hasRole.name}**.`;
+
+        if (failCount > 0) {
+            response += `\n⚠️ Failed to add role to ${failCount} member(s).`;
+            if (failedMembers.length <= 10) {
+                response += `\nFailed: ${failedMembers.join(', ')}`;
+            }
+        }
+
+        await interaction.editReply(response);
+
+        console.log(`🎭 Mass role: ${interaction.user.tag} gave "${giveRole.name}" to ${successCount} members with "${hasRole.name}"`);
+
+    } catch (error) {
+        console.error('❌ Error in mass role command:', error);
+        if (interaction.deferred) {
+            await interaction.editReply('❌ An error occurred while adding roles.');
+        } else {
+            await interaction.reply({
+                content: '❌ An error occurred while adding roles.',
+                ephemeral: true
+            });
+        }
+    }
+}
+
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
@@ -5990,7 +6414,9 @@ const commandHandlers = {
     'admin_give': handleAdminGive,
     'admin_stats': handleAdminStats,
     'admin_leaderboard': handleAdminLeaderboard,
-    'setupshops': setupShops
+    'setupshops': setupShops,
+    'rolesnapshot': handleRoleSnapshot,
+    'massrole': handleMassRole
 };
 
 // Main command handler function
@@ -6390,63 +6816,117 @@ async function shouldSendRandomMessage(channelId) {
     // Get recent conversation activity
     const recentContext = await getChannelContext(channelId, 10);
     if (recentContext.length === 0) return false;
-    
+
     // Check last message time
     const lastMessageTime = recentContext[recentContext.length - 1].timestamp || 0;
     const timeSinceLastMessage = Date.now() - lastMessageTime;
-    
+
     // Don't send if conversation is too old (> 2 hours) or too recent (< 2 minutes)
     if (timeSinceLastMessage > 7200000 || timeSinceLastMessage < 120000) return false;
-    
+
     // Check if bot last message was too recent
     const lastBotMessage = recentContext.filter(msg => msg.is_bot).pop();
     if (lastBotMessage) {
         const timeSinceBotMessage = Date.now() - (lastBotMessage.timestamp || 0);
         if (timeSinceBotMessage < 600000) return false; // 10 minute cooldown
     }
-    
+
+    // READ THE ROOM: Check emotional context - don't interrupt serious/negative conversations
+    const recentSentiments = recentContext
+        .filter(msg => !msg.is_bot && msg.sentiment)
+        .slice(-5)
+        .map(msg => msg.sentiment);
+
+    if (recentSentiments.length > 0) {
+        const negativeCount = recentSentiments.filter(s => s === 'negative').length;
+        // If 60%+ of recent messages are negative, don't interrupt (people might be venting/discussing something serious)
+        if (negativeCount / recentSentiments.length > 0.6) {
+            console.log('📖 Reading the room: conversation seems serious, skipping random message');
+            return false;
+        }
+    }
+
     // Check active users
     const activeUsers = await getActiveUsersInConversation(channelId, 3600000); // 1 hour
     return activeUsers.length >= 2; // At least 2 people talking
 }
 
-// Enhanced random message with context awareness
+// Enhanced random message with context awareness, emotional intelligence, and user memories
 async function generateRandomMessage(channel) {
     try {
         // Get conversation context
         const recentContext = await getChannelContext(channel.id, 10);
         const activeUsers = await getActiveUsersInConversation(channel.id);
-        
-        // Sometimes reference recent conversation (30% chance)
-        if (Math.random() < 0.3 && recentContext.length > 0) {
-            const recentTopics = recentContext.map(msg => msg.content).join(' ');
-            
+
+        // Get emotional tone of recent conversation
+        const recentSentiments = recentContext
+            .filter(msg => !msg.is_bot && msg.sentiment)
+            .slice(-5)
+            .map(msg => msg.sentiment);
+
+        const dominantMood = recentSentiments.length > 0
+            ? recentSentiments.reduce((a, b, _, arr) =>
+                arr.filter(v => v === a).length >= arr.filter(v => v === b).length ? a : b
+            )
+            : 'neutral';
+
+        // Sometimes reference recent conversation with memory awareness (40% chance if people are active)
+        if (Math.random() < 0.4 && recentContext.length > 0 && activeUsers.length > 0) {
+            // Get memories about active users
+            let userMemoriesText = '';
+            if (activeUsers.length > 0 && activeUsers.length <= 3) {
+                for (const user of activeUsers.slice(0, 2)) { // Max 2 users to avoid token overflow
+                    const memories = await getUserMemories(user.user_id, null, 3);
+                    if (memories.length > 0) {
+                        userMemoriesText += `\n${user.username}: ${memories.map(m => m.fact).join(', ')}`;
+                    }
+                }
+            }
+
             const response = await openai.chat.completions.create({
                 model: 'gpt-4o-mini',
                 messages: [
-                    { 
-                        role: 'system', 
-                        content: casualPersonality + 
-                        '\n\nYou want to jump into the conversation naturally. Reference something that was said earlier or ask a follow-up question. Keep it short and casual.'
+                    {
+                        role: 'system',
+                        content: casualPersonality +
+                        '\n\nYou want to jump into the conversation naturally. Reference something that was said earlier or ask a follow-up question. Keep it short and casual (1-2 sentences).' +
+                        '\n\nCurrent mood: ' + dominantMood + ' - match the energy appropriately.' +
+                        (userMemoriesText ? '\n\nWhat you remember about people here:' + userMemoriesText : '') +
+                        '\n\nDon\'t be annoying or interrupt if the vibe is off. Be natural and read the room.'
                     },
                     ...recentContext.slice(-5).map(msg => ({
                         role: msg.is_bot ? 'assistant' : 'user',
                         content: msg.is_bot ? msg.content : `${msg.username}: ${msg.content}`
                     })),
-                    { 
-                        role: 'user', 
+                    {
+                        role: 'user',
                         content: 'Generate a natural message to continue or revive this conversation'
                     }
                 ],
-                temperature: 0.9,
-                max_tokens: 100
+                temperature: 1.1, // Higher temperature for more natural randomness
+                max_tokens: 80, // Keep it short
+                presence_penalty: 0.6,
+                frequency_penalty: 0.3
             });
-            
+
             return response.choices[0].message.content;
         }
-        
-        // Otherwise use time-based starter
-        return getTimeBasedStarter();
+
+        // Otherwise use time-based starter (but match mood if possible)
+        const starter = getTimeBasedStarter();
+
+        // If mood is negative and we're using a generic starter, be more supportive
+        if (dominantMood === 'negative' && Math.random() < 0.5) {
+            const supportiveStarters = [
+                "hey... everything okay in here?",
+                "you all seem kinda quiet... want some tea? 🍵",
+                "feels kinda heavy in here... anything i can help with?",
+                "...is it just me or is the vibe a bit off today?"
+            ];
+            return supportiveStarters[Math.floor(Math.random() * supportiveStarters.length)];
+        }
+
+        return starter;
     } catch (error) {
         console.error('❌ Error generating random message:', error);
         return getTimeBasedStarter();
@@ -6728,6 +7208,8 @@ if (interaction.isChatInputCommand()) {
         case 'admin_stats':
         case 'admin_leaderboard':
         case 'setupshops':
+        case 'rolesnapshot':
+        case 'massrole':
             if (!isAdmin(interaction.member)) {
                 await interaction.reply({
                     content: 'You do not have permission to use this command.',
@@ -6764,6 +7246,12 @@ if (interaction.isChatInputCommand()) {
                 case 'setupshops':
                     await setupShops();
                     await interaction.reply('Shops have been set up successfully!');
+                    break;
+                case 'rolesnapshot':
+                    await handleRoleSnapshot(interaction);
+                    break;
+                case 'massrole':
+                    await handleMassRole(interaction);
                     break;
             }
             break;
@@ -7595,6 +8083,9 @@ async function handleAI(message) {
         await processMemoryTriggers(message.author.id, query, null);
         await enhancedProcessMemoryTriggers(message.author.id, query, message.author.username);
 
+        // Detect and track favorite topics
+        await detectAndTrackTopics(message.author.id, message.author.username, query);
+
         // Get temporal context (time, date awareness)
         const timeContext = getTemporalContext();
 
@@ -7621,6 +8112,13 @@ async function handleAI(message) {
             if (relationshipContext.shouldGreet) {
                 userContext += `\n- NOTE: You haven't talked to them in a while, acknowledge this naturally!`;
             }
+        }
+
+        // Add favorite topics
+        const favoriteTopics = await getUserFavoriteTopics(message.author.id);
+        if (favoriteTopics.length > 0) {
+            userContext += `\n\nTheir interests: ${favoriteTopics.join(', ')}`;
+            userContext += `\n(You can naturally reference these topics when relevant)`;
         }
 
         // PHASE 2: Proactive Memory & Curiosity
