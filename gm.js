@@ -4626,16 +4626,6 @@ const commands = [
             option.setName('cost')
                 .setDescription('Cost per entry (for currency raffles)')),
 
-    // Utility commands
-    new SlashCommandBuilder()
-        .setName('archive')
-        .setDescription('Archive the current channel content')
-        .addIntegerOption(option => 
-            option.setName('days')
-                .setDescription('Number of days to archive (leave empty for all messages)')
-                .setMinValue(1)
-                .setRequired(false)),
-
     // Admin commands
     new SlashCommandBuilder()
         .setName('admin_items')
@@ -4804,7 +4794,7 @@ const commands = [
                 .setRequired(true)),
 
     new SlashCommandBuilder()
-        .setName('layout')
+        .setName('archive')
         .setDescription('Archive categories/channels or create server snapshot (Admin only)')
         .addSubcommand(subcommand =>
             subcommand
@@ -4878,7 +4868,7 @@ function verifyCommands() {
         'poll', 'raffle',
         'admin_items', 'admin_inventory', 'admin_update', 'admin_searchitem',
         'admin_item', 'admin_give', 'admin_stats', 'admin_leaderboard', 'setupshops', 'rolesnapshot', 'massrole',
-        'layout', 'restore', 'snapshots'
+        'archive', 'restore', 'snapshots'
     ];
 
     console.log('=== COMMAND VERIFICATION ===');
@@ -6405,7 +6395,7 @@ function serializePermissions(channel) {
 }
 
 // Handle archive command
-async function handleLayoutCommand(interaction) {
+async function handleArchiveCommand(interaction) {
     try {
         if (!isAdmin(interaction.member)) {
             await interaction.reply({
@@ -7210,7 +7200,7 @@ const commandHandlers = {
     'setupshops': setupShops,
     'rolesnapshot': handleRoleSnapshot,
     'massrole': handleMassRole,
-    'layout': handleLayoutCommand,
+    'archive': handleArchiveCommand,
     'restore': handleRestoreCommand,
     'snapshots': handleSnapshotsCommand
 };
@@ -8025,10 +8015,6 @@ if (interaction.isChatInputCommand()) {
             await handleConvertCommand(interaction);
             break;
 
-        case 'archive':
-            await handleArchiveCommand(interaction);
-            break;
-
         // Admin Commands
         case 'admin_items':
         case 'admin_update':
@@ -8041,7 +8027,7 @@ if (interaction.isChatInputCommand()) {
         case 'setupshops':
         case 'rolesnapshot':
         case 'massrole':
-        case 'layout':
+        case 'archive':
         case 'restore':
         case 'snapshots':
             if (!isAdmin(interaction.member)) {
@@ -8087,8 +8073,8 @@ if (interaction.isChatInputCommand()) {
                 case 'massrole':
                     await handleMassRole(interaction);
                     break;
-                case 'layout':
-                    await handleLayoutCommand(interaction);
+                case 'archive':
+                    await handleArchiveCommand(interaction);
                     break;
                 case 'restore':
                     await handleRestoreCommand(interaction);
@@ -8586,7 +8572,7 @@ async function handleAdminItemCommand(interaction) {
     }
 }
 
-async function handleLayoutCommand(interaction) {
+async function handleArchiveCommand(interaction) {
     try {
         await interaction.deferReply({ ephemeral: true });
         
